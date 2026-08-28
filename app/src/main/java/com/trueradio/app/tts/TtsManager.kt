@@ -50,7 +50,14 @@ class TtsManager(
             .build()
     }
 
+    // A single TextToSpeech instance is created once and reused for the lifetime of this
+    // manager. The original version of this code created a brand-new TextToSpeech engine on
+    // every single fallback call without ever releasing the previous one - for anyone who skips
+    // the optional ElevenLabs key (or exhausts its free-tier quota after a few hours), every DJ
+    // line would go through this path, leaking a new bound system TTS engine each time and
+    // eventually degrading or crashing a long-running session.
     private var androidTts: TextToSpeech? = null
+    private var androidTtsReady = false
 
     companion object {
         private const val TAG = "TtsManager"
@@ -103,40 +110,54 @@ class TtsManager(
         }
     }
 
-    private suspend fun speakLocally(text: String) = suspendCancellableCoroutine<Unit> { cont ->
-        val utteranceId = UUID.randomUUID().toString()
+    private suspend fun speakLocally(text: String) {
+        val tts = getOrInitAndroidTts()
+        speakWithTts(tts, text)
+    }
 
-        fun speakNow(tts: TextToSpeech) {
-            tts.language = Locale("iw", "IL") // Hebrew; falls back silently if unsupported on device
-            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    if (cont.isActive) cont.resume(Unit)
-                }
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    if (cont.isActive) cont.resumeWithException(IOException("Local TTS error"))
-                }
-            })
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-        }
+    /** Initializes the shared TextToSpeech instance on first use only; later calls reuse it directly. */
+    private suspend fun getOrInitAndroidTts(): TextToSpeech {
+        val existing = androidTts
+        if (existing != null && androidTtsReady) return existing
 
-        androidTts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                androidTts?.let { speakNow(it) }
-            } else if (cont.isActive) {
-                cont.resumeWithException(IOException("Local TTS init failed"))
+        return suspendCancellableCoroutine { cont ->
+            val tts = TextToSpeech(context) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    androidTtsReady = true
+                    androidTts?.language = Locale("iw", "IL") // Hebrew; falls back silently if unsupported on device
+                    androidTts?.let { if (cont.isActive) cont.resume(it) }
+                } else if (cont.isActive) {
+                    cont.resumeWithException(IOException("Local TTS init failed"))
+                }
             }
+            androidTts = tts
         }
+    }
+
+    /** Speaks one utterance on an already-initialized engine, suspending until playback finishes. */
+    private suspend fun speakWithTts(tts: TextToSpeech, text: String) = suspendCancellableCoroutine<Unit> { cont ->
+        val utteranceId = UUID.randomUUID().toString()
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                if (cont.isActive) cont.resume(Unit)
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                if (cont.isActive) cont.resumeWithException(IOException("Local TTS error"))
+            }
+        })
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
 
         cont.invokeOnCancellation {
-            androidTts?.stop()
+            tts.stop()
         }
     }
 
     fun release() {
         androidTts?.shutdown()
         androidTts = null
+        androidTtsReady = false
     }
 
     private data class ElevenLabsRequest(

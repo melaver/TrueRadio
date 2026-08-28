@@ -2,9 +2,7 @@ package com.trueradio.app.service
 
 import android.app.Notification
 import android.app.PendingIntent
-import android.app.Service
 import android.content.Intent
-import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
@@ -30,6 +28,8 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Calendar
 
 /**
@@ -69,7 +69,20 @@ class RadioForegroundService : LifecycleService() {
     private var hasFiredTriviaForCurrentTrack = false
     private var lastNewsFlashHour = -1
     private var lastGenreSwitchHour = -1
-    private var isSpeaking = false
+
+    // Guards the DJ's "one voice at a time" invariant. This used to be a plain `isSpeaking`
+    // boolean set true only deep inside speakLine() - but news and genre-switch both fire in the
+    // *same* 0-3-minutes-past-the-hour window, and both are checked back-to-back synchronously
+    // inside a single onPlayerState() call. Since lifecycleScope uses Dispatchers.Main.immediate,
+    // each trigger's coroutine runs synchronously up to its first suspension point (the network
+    // call) before the next trigger check even runs - meaning BOTH would see isSpeaking still
+    // false and both proceed, only setting the flag true later once each independently reached
+    // speakLine(). For anyone with both news and personalized genre mixing enabled (the common
+    // case), this meant the news flash and the genre-change line would talk over each other
+    // basically every hour. tryLock() here is synchronous and atomic, so whichever trigger calls
+    // it first genuinely wins; the other bails out immediately and retries on the next
+    // player-state tick, by which point the winner has likely finished and released the lock.
+    private val speakingMutex = Mutex()
 
     private val _status = MutableStateFlow("Idle")
     val status: StateFlow<String> get() = _status
@@ -137,7 +150,7 @@ class RadioForegroundService : LifecycleService() {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         if (spotifyWebAuthManager?.isConnected() == true) {
             lastGenreSwitchHour = hour
-            runGenreSwitch(hour, announce = false)
+            speakingMutex.withLock { runGenreSwitch(hour, announce = false) }
         } else {
             manager.playForSegment(DaySegment.forHour(hour))
         }
@@ -158,7 +171,7 @@ class RadioForegroundService : LifecycleService() {
 
         updateNotification("${track.artist} - ${track.title}", track.isPaused)
 
-        if (isSpeaking || track.isPaused) return
+        if (speakingMutex.isLocked || track.isPaused) return
 
         maybeTriggerHourlyNews()
         maybeTriggerGenreSwitch()
@@ -172,9 +185,16 @@ class RadioForegroundService : LifecycleService() {
         val minute = calendar.get(Calendar.MINUTE)
         if (minute > NEWS_WINDOW_MINUTE_CUTOFF) return
         if (hour == lastNewsFlashHour) return
+        if (!speakingMutex.tryLock()) return // something else is already speaking; retry on the next player-state tick
 
         lastNewsFlashHour = hour
-        lifecycleScope.launch { runNewsFlash() }
+        lifecycleScope.launch {
+            try {
+                runNewsFlash()
+            } finally {
+                speakingMutex.unlock()
+            }
+        }
     }
 
     /** Top-of-hour genre switch: fires once per hour if Spotify Web API is connected. */
@@ -185,11 +205,16 @@ class RadioForegroundService : LifecycleService() {
         val minute = calendar.get(Calendar.MINUTE)
         if (minute > GENRE_WINDOW_MINUTE_CUTOFF) return
         if (hour == lastGenreSwitchHour) return
+        if (!speakingMutex.tryLock()) return // something else is already speaking; retry on the next player-state tick
 
         lastGenreSwitchHour = hour
         lifecycleScope.launch {
-            if (spotifyWebAuthManager?.isConnected() == true) {
-                runGenreSwitch(hour, announce = true)
+            try {
+                if (spotifyWebAuthManager?.isConnected() == true) {
+                    runGenreSwitch(hour, announce = true)
+                }
+            } finally {
+                speakingMutex.unlock()
             }
         }
     }
@@ -199,9 +224,18 @@ class RadioForegroundService : LifecycleService() {
         if (hasFiredTriviaForCurrentTrack) return
         if (track.durationMs <= 0) return
         val remaining = track.durationMs - track.positionMs
-        if (remaining in 0..TRIVIA_TRIGGER_WINDOW_MS) {
-            hasFiredTriviaForCurrentTrack = true
-            lifecycleScope.launch { runTrackTrivia(track) }
+        if (remaining !in 0..TRIVIA_TRIGGER_WINDOW_MS) return
+        if (!speakingMutex.tryLock()) return // something else is already speaking; if the ~15s window
+        // closes before it frees up, this track's trivia is simply skipped (hasFiredTriviaForCurrentTrack
+        // stays false, but the next track resets it anyway) - a rare missed line beats overlapping speech.
+
+        hasFiredTriviaForCurrentTrack = true
+        lifecycleScope.launch {
+            try {
+                runTrackTrivia(track)
+            } finally {
+                speakingMutex.unlock()
+            }
         }
     }
 
@@ -231,7 +265,8 @@ class RadioForegroundService : LifecycleService() {
         val engine = hourlyMixEngine ?: return
         val manager = spotifyManager ?: return
         val rotation = settings.snapshotGenreRotation()
-        val genre = rotation.genreForHour(hour) ?: return
+        val daySeed = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        val genre = rotation.genreForHour(hour, daySeed) ?: return
 
         updateStatus("Building $genre mix for this hour...")
         val playlistUriResult = engine.buildAndPublishMixForGenre(genre)
@@ -268,7 +303,6 @@ class RadioForegroundService : LifecycleService() {
     private suspend fun speakLine(script: String, label: String) {
         val tts = ttsManager ?: return
         val manager = spotifyManager
-        isSpeaking = true
         updateStatus("$label: speaking...")
         try {
             when (val result = tts.synthesize(script)) {
@@ -283,7 +317,6 @@ class RadioForegroundService : LifecycleService() {
                 }
             }
         } finally {
-            isSpeaking = false
             updateStatus("On air")
         }
         // Resume Spotify playback in case it was paused by the OS during the ducking window.

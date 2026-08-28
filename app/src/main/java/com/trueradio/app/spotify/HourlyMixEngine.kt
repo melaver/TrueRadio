@@ -36,6 +36,20 @@ class HourlyMixEngine(
 
         val topArtistsResult = webApi.getTopArtists()
         val topTracksResult = webApi.getTopTracks()
+
+        // If both basic personalization calls failed outright (as opposed to just returning
+        // empty lists), it's almost certainly an auth/network problem affecting the whole
+        // session - surface that real error rather than masking it behind a generic "no tracks
+        // found for this genre" message further down, which would send the user chasing the
+        // wrong problem (e.g. trying broader genre names when the actual issue is an expired
+        // Spotify connection).
+        if (topArtistsResult.isFailure && topTracksResult.isFailure) {
+            return Result.failure(
+                topArtistsResult.exceptionOrNull() ?: topTracksResult.exceptionOrNull()
+                ?: IllegalStateException("Failed to read Spotify listening history")
+            )
+        }
+
         val topArtists = topArtistsResult.getOrDefault(emptyList())
         val topTracks = topTracksResult.getOrDefault(emptyList())
 
@@ -70,7 +84,18 @@ class HourlyMixEngine(
             return Result.failure(IllegalStateException("Could not find any tracks for genre '$genre' - try a broader genre name"))
         }
 
-        webApi.replacePlaylistTracks(playlistId, finalUris).getOrElse { return Result.failure(it) }
+        val replaceResult = webApi.replacePlaylistTracks(playlistId, finalUris)
+        if (replaceResult.isFailure) {
+            // The cached playlist may have been deleted or unfollowed by the user outside the
+            // app - without this fallback, every future hourly switch would fail forever against
+            // a dead playlist ID with no way to recover short of clearing app data. Drop the
+            // cached id and create a fresh playlist once before giving up.
+            settings.saveSpotifyHourlyPlaylistId("")
+            val newPlaylistId = ensurePlaylistExists().getOrElse { return Result.failure(it) }
+            webApi.replacePlaylistTracks(newPlaylistId, finalUris).getOrElse { return Result.failure(it) }
+            return Result.success("spotify:playlist:$newPlaylistId")
+        }
+
         return Result.success("spotify:playlist:$playlistId")
     }
 

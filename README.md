@@ -46,14 +46,24 @@ TrueRadio/
 1. Go to <https://developer.spotify.com/dashboard> and log in with the Spotify account you'll
    test with.
 2. Click **Create app**. Fill in an app name/description (anything).
-3. Under **Redirect URIs**, add: `trueradio://callback`
-   (this must match the `redirectUri` passed into `SpotifyManager` in
-   `RadioForegroundService.kt` — change both together if you use a different scheme).
-4. Under **Which API/SDKs are you planning to use?**, check **Android**.
-5. Save, then open **Edit Settings** and add your app's **package name**
-   (`com.trueradio.app`) and the **SHA-1 fingerprint** of the signing certificate you'll build
-   with (for debug builds: `keytool -list -v -keystore ~/.android/debug.keystore -alias
-   androiddebugkey -storepass android -keypass android`).
+3. Under **Redirect URIs**, add **both**: `trueradio://callback` (App Remote) and
+   `trueradio://spotify-web-callback` (Web API OAuth, used by the personalized hourly genre mix
+   — see section 6). Missing either one means that specific feature can't connect later.
+4. Under **Which API/SDKs are you planning to use?**, check **Android** and **Web API**.
+5. Save, then open **Edit Settings** and add your app's **package name** (`com.trueradio.app`)
+   and the **SHA-1 fingerprint** of the debug keystore this project ships with:
+
+   ```bash
+   keytool -list -v -keystore app/debug.keystore -alias androiddebugkey -storepass android -keypass android
+   ```
+
+   **Important:** this project uses a fixed, committed `app/debug.keystore` (wired up in
+   `app/build.gradle.kts`'s `signingConfigs`) instead of the usual per-machine
+   `~/.android/debug.keystore`. That's deliberate: if every machine — or worse, every ephemeral
+   GitHub Actions run — generated its own random debug key, the SHA-1 you register here would
+   stop matching after the very next build. Because everyone builds against the same checked-in
+   key, the SHA-1 you register once stays valid forever, locally and in CI alike. **Never do
+   this for a release keystore** — that one must stay private and out of version control.
 6. Copy the **Client ID** shown on the dashboard — this is what you paste into the app's
    "Spotify Client ID" field (or hardcode into `SecureSettings` for local testing).
 7. Download the **Spotify App Remote SDK** AAR from the same dashboard's SDK page (or
@@ -92,6 +102,27 @@ gradle wrapper --gradle-version 8.7   # generates gradlew if you don't already h
 Open the project in Android Studio (Giraffe/Koala or newer) for the easiest first run — it will
 prompt to sync Gradle and download the SDK/platform automatically. Install on a device with the
 Spotify app already installed and logged in.
+
+### Exporting an APK without Android Studio
+
+If you don't have Android Studio or a local Android SDK, use the included GitHub Actions
+workflow (`.github/workflows/build-apk.yml`) instead — it builds on GitHub's own servers, which
+have full access to the Android SDK and Google's Maven repo:
+
+1. Push this project to a GitHub repo (`git init && git add . && git commit -m "init" && git
+   push` to a new repo you've created on GitHub).
+2. Before pushing, add the Spotify App Remote `.aar` to `app/libs/` and remove the
+   `app/libs/*.aar` line from `.gitignore` so it's actually committed — the CI runner can't
+   download it for you since it isn't published to Maven (see step 1.7 above).
+3. The workflow runs automatically on every push to `main`/`master`, or trigger it manually from
+   the repo's **Actions** tab → "Build debug APK" → **Run workflow**.
+4. When the run finishes (a few minutes), open it and download the `TrueRadio-debug-apk` artifact
+   from the **Artifacts** section at the bottom of the run page — that's a zip containing
+   `app-debug.apk`, installable on any Android device with "install from unknown sources" enabled.
+
+This produces a **debug**-signed APK, fine for personal use and testing. For a Play Store release
+you'll additionally need to generate a release keystore and add a signing config — Android
+Studio's Build → Generate Signed Bundle/APK wizard is the simplest way to do that.
 
 ## 5. News preferences & sources
 

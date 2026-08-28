@@ -1,10 +1,14 @@
 package com.trueradio.app.spotify
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import androidx.browser.customtabs.CustomTabsIntent
 import com.trueradio.app.SecureSettings
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
@@ -42,6 +46,14 @@ class SpotifyWebAuthManager(
             .build()
     }
 
+    // Guards token refresh so concurrent callers coalesce onto a single refresh instead of each
+    // firing their own refresh_token grant. Not currently reachable since HourlyMixEngine calls
+    // Web API methods sequentially, but some OAuth providers rotate/invalidate the refresh token
+    // on use - if a future change ever parallelizes these calls (e.g. via async{}), two
+    // simultaneous refreshes using the same stale refresh token would otherwise race, with the
+    // loser failing with invalid_grant. Cheap to guard against now rather than debug it later.
+    private val refreshMutex = Mutex()
+
     companion object {
         private const val AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
         private const val TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -68,7 +80,16 @@ class SpotifyWebAuthManager(
             .appendQueryParameter("scope", REQUIRED_SCOPES.joinToString(" "))
             .build()
 
-        CustomTabsIntent.Builder().build().launchUrl(context, authUri)
+        val customTabsIntent = CustomTabsIntent.Builder().build()
+        // Android requires FLAG_ACTIVITY_NEW_TASK to start an activity (which launching a
+        // Custom Tab does) from anything other than an Activity context - e.g. applicationContext.
+        // MainActivity constructs this class with applicationContext (to avoid leaking an Activity
+        // reference across a suspend call), so this flag is required here or the app crashes with
+        // "Calling startActivity() from outside of an Activity context requires FLAG_ACTIVITY_NEW_TASK".
+        if (context !is Activity) {
+            customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        customTabsIntent.launchUrl(context, authUri)
     }
 
     /**
@@ -113,7 +134,17 @@ class SpotifyWebAuthManager(
         if (current.isNotBlank() && System.currentTimeMillis() < expiresAt - 30_000) {
             return@withContext Result.success(current)
         }
-        refreshAccessToken()
+        refreshMutex.withLock {
+            // Re-check after acquiring the lock: another caller may have already refreshed
+            // while we were waiting, in which case we can just use that result.
+            val recheckExpiresAt = settings.snapshotSpotifyWebTokenExpiresAt()
+            val recheckCurrent = settings.snapshotSpotifyWebAccessToken()
+            if (recheckCurrent.isNotBlank() && System.currentTimeMillis() < recheckExpiresAt - 30_000) {
+                Result.success(recheckCurrent)
+            } else {
+                refreshAccessToken()
+            }
+        }
     }
 
     private suspend fun refreshAccessToken(): Result<String> = withContext(Dispatchers.IO) {

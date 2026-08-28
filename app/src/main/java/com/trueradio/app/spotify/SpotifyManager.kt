@@ -70,18 +70,29 @@ class SpotifyManager(
         }
         val subscription = remote.playerApi.subscribeToPlayerState()
         subscription.setEventCallback { state: PlayerState ->
-            val track = state.track
-            if (track != null) {
-                trySend(
-                    TrackInfo(
-                        uri = track.uri,
-                        title = track.name,
-                        artist = track.artist.name,
-                        durationMs = track.duration,
-                        positionMs = state.playbackPosition,
-                        isPaused = state.isPaused
+            try {
+                val track = state.track
+                if (track != null) {
+                    // Defensive nulls: Spotify's protocol types are Java platform types, so
+                    // Kotlin won't statically stop a null artist/name/uri from reaching us (e.g.
+                    // podcast episodes, ads, or certain local files can have incomplete
+                    // metadata) - an unguarded .name here would throw an uncaught NPE on the
+                    // SDK's callback thread and likely crash the whole app, not just this update.
+                    trySend(
+                        TrackInfo(
+                            uri = track.uri ?: "",
+                            title = track.name ?: "Unknown Track",
+                            artist = track.artist?.name ?: "Unknown Artist",
+                            durationMs = track.duration,
+                            positionMs = state.playbackPosition,
+                            isPaused = state.isPaused
+                        )
                     )
-                )
+                }
+            } catch (e: Exception) {
+                // Belt-and-suspenders: any other unexpected shape from the SDK just skips this
+                // one update instead of taking down the process from a third-party callback.
+                Log.e(TAG, "Failed to process PlayerState update", e)
             }
         }
         subscription.setErrorCallback { close(it) }

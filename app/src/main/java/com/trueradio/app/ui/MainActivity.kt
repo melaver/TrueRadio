@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -37,6 +38,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var settings: SecureSettings
     private var spotifyWebAuthManager: SpotifyWebAuthManager? = null
     private val webApiConnectedState = mutableStateOf(false)
+    // Tracks an in-flight "Connect Spotify Account" attempt so a double-tap can't fire a second
+    // beginAuthorization() before the first completes - that would overwrite the saved PKCE code
+    // verifier, causing the FIRST browser tab's eventual token exchange to fail with a PKCE
+    // mismatch if the user finishes that one instead of the second. Reset in onResume() rather
+    // than only on success, so backing out of the browser without finishing doesn't leave the
+    // button permanently disabled with no way to retry.
+    private val isConnectingSpotifyWebState = mutableStateOf(false)
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
@@ -53,6 +61,7 @@ class MainActivity : ComponentActivity() {
                     DjScreen(
                         settings = settings,
                         isSpotifyWebConnected = webApiConnectedState.value,
+                        isConnectingSpotifyWeb = isConnectingSpotifyWebState.value,
                         onStart = { spotifyClientId -> startDjService(spotifyClientId) },
                         onStop = { stopDjService() },
                         onConnectSpotifyWeb = { clientId -> beginSpotifyWebAuth(clientId) },
@@ -63,6 +72,16 @@ class MainActivity : ComponentActivity() {
         }
 
         handleIntentIfAuthRedirect(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // See isConnectingSpotifyWebState's declaration: this covers both "user completed the
+        // Spotify consent flow and got redirected back" (onNewIntent runs first, then onResume -
+        // harmless to reset here since refreshWebApiConnectedState() already reflects the result)
+        // and "user backed out of the browser without finishing" (plain onResume, no new intent -
+        // this is the case that actually needs the reset, so the button isn't stuck disabled).
+        isConnectingSpotifyWebState.value = false
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -86,6 +105,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginSpotifyWebAuth(clientId: String) {
+        if (isConnectingSpotifyWebState.value) return // already in flight; ignore a rapid double-tap
+        isConnectingSpotifyWebState.value = true
         lifecycleScope.launch {
             val authManager = SpotifyWebAuthManager(applicationContext, settings, clientId)
             spotifyWebAuthManager = authManager
@@ -144,6 +165,7 @@ class MainActivity : ComponentActivity() {
 fun DjScreen(
     settings: SecureSettings,
     isSpotifyWebConnected: Boolean,
+    isConnectingSpotifyWeb: Boolean,
     onStart: (spotifyClientId: String) -> Unit,
     onStop: () -> Unit,
     onConnectSpotifyWeb: (spotifyClientId: String) -> Unit,
@@ -179,7 +201,15 @@ fun DjScreen(
     var genreSequential by remember(savedGenreRotation) { mutableStateOf(savedGenreRotation.sequential) }
     var newGenreText by remember { mutableStateOf("") }
 
-    var isRunning by remember { mutableStateOf(false) }
+    // rememberSaveable (not remember) so this survives device rotation - with a plain `remember`,
+    // rotating the screen while the DJ service is actually running in the background would reset
+    // this back to false, showing "Idle" with an enabled "Connect & Start" button (inviting a
+    // duplicate connection attempt) and a disabled "Disconnect" the user has no way to re-enable.
+    // NOTE: this still doesn't reflect reality if the service is stopped by other means (the
+    // notification's Stop button, the system killing the process, etc.) - a real fix needs the
+    // service to expose its actual running state (e.g. a bound interface or a persisted flag)
+    // rather than the UI tracking its own separate assumption of it.
+    var isRunning by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -381,10 +411,16 @@ fun DjScreen(
             onClick = {
                 if (isSpotifyWebConnected) onDisconnectSpotifyWeb() else onConnectSpotifyWeb(spotifyClientId)
             },
-            enabled = spotifyClientId.isNotBlank(),
+            enabled = spotifyClientId.isNotBlank() && !isConnectingSpotifyWeb,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isSpotifyWebConnected) "Disconnect Spotify Account" else "Connect Spotify Account")
+            Text(
+                when {
+                    isConnectingSpotifyWeb -> "Connecting..."
+                    isSpotifyWebConnected -> "Disconnect Spotify Account"
+                    else -> "Connect Spotify Account"
+                }
+            )
         }
 
         Text("Genre rotation", style = MaterialTheme.typography.labelLarge)
@@ -454,8 +490,18 @@ fun DjScreen(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(
                 onClick = {
-                    isRunning = true
-                    onStart(spotifyClientId)
+                    // Persist whatever is currently in all four fields before starting, rather
+                    // than relying on the user having separately tapped "Save Keys" first. The
+                    // service reads Gemini/ElevenLabs keys straight from persisted settings (only
+                    // the Spotify Client ID gets passed as a live override) - skipping this meant
+                    // someone who filled in the fields and went straight to "Connect & Start"
+                    // would get music playing fine but the DJ silently never speaking, with no
+                    // obvious reason why.
+                    scope.launch {
+                        settings.saveAll(spotifyClientId, geminiKey, elevenLabsKey, elevenLabsVoiceId)
+                        isRunning = true
+                        onStart(spotifyClientId)
+                    }
                 },
                 enabled = !isRunning && spotifyClientId.isNotBlank(),
                 modifier = Modifier.weight(1f)

@@ -8,5 +8,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+# App Remote isn't on Maven, so app/libs/*.aar is normally excluded from version control.
+# If you want the GitHub Actions CI build (.github/workflows/build-apk.yml) to succeed, comment
+# out the next two lines and commit the real .aar file, or add it via a separate CI step instead.
+app/libs/*.aar
 app/libs/*.jar
 !app/libs/.gitkeep

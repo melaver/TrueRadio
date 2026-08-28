@@ -15,7 +15,26 @@ android {
         versionName = "1.0.0"
     }
 
+    // A fixed, checked-in debug keystore (app/debug.keystore) is used instead of the default
+    // per-machine ~/.android/debug.keystore. This matters because Spotify's Dashboard requires
+    // registering the SHA-1 of the signing key your APK is built with - if every machine (or
+    // worse, every ephemeral CI run) generated its own random debug key, that SHA-1 would never
+    // match and Spotify would reject the connection. Using one committed keystore means local
+    // builds, CI builds, and everyone on the team sign with the exact same key, so the SHA-1
+    // registered once in the Dashboard stays valid forever. Never do this for a release key.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
@@ -61,6 +80,7 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-core")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Coroutines

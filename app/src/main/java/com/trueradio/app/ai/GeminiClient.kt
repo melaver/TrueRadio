@@ -34,7 +34,7 @@ class GeminiClient(private val apiKey: String) {
     companion object {
         private const val MODEL = "gemini-2.5-flash"
         private const val ENDPOINT_TEMPLATE =
-            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
+            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 
         /**
          * Persona system instruction shared by every generated script. Keep this centralized
@@ -97,7 +97,7 @@ class GeminiClient(private val apiKey: String) {
     /** Generic entry point used by both news + trivia flows. */
     suspend fun generateScript(prompt: String): Result<String> = withContext(Dispatchers.IO) {
         try {
-            val url = ENDPOINT_TEMPLATE.format(MODEL, apiKey)
+            val url = ENDPOINT_TEMPLATE.format(MODEL)
             val requestBody = GeminiRequest(
                 contents = listOf(
                     GeminiContent(parts = listOf(GeminiPart(text = prompt)))
@@ -106,7 +106,16 @@ class GeminiClient(private val apiKey: String) {
             )
             val json = gson.toJson(requestBody)
             val body = json.toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url(url).post(body).build()
+            // The API key goes in a header rather than the ?key= query param used in most
+            // Gemini quickstart examples: HttpLoggingInterceptor.Level.BASIC logs the full
+            // request line including the URL, so a query-param key would otherwise get written
+            // to Logcat in plaintext on every single call - readable by anyone who pulls a
+            // logcat dump, including the person debugging this app.
+            val request = Request.Builder()
+                .url(url)
+                .addHeader("x-goog-api-key", apiKey)
+                .post(body)
+                .build()
 
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {

@@ -77,8 +77,14 @@ data class NewsSource(
     val url: String,
     val enabled: Boolean = true
 ) {
-    /** Serialized as "id\u0001name\u0001url\u0001enabled", joined across sources with a newline. */
-    fun serialize(): String = listOf(id, name, url, enabled.toString()).joinToString("\u0001")
+    /**
+     * Serialized as "id\u0001name\u0001url\u0001enabled", joined across sources with a newline.
+     * Strips any stray \u0001 or newline characters from the fields first - both are vanishingly
+     * unlikely in a real name/URL, but a corrupted clipboard paste containing either would
+     * otherwise desync field counts on the next load and silently drop or garble a source.
+     */
+    fun serialize(): String = listOf(id, name, url, enabled.toString())
+        .joinToString("\u0001") { it.replace("\u0001", "").replace("\n", " ") }
 
     companion object {
         val DEFAULT_SOURCES = listOf(
@@ -147,17 +153,23 @@ data class GenreRotation(
     /** If true, the hour's genre is picked in fixed round-robin order; if false, picked at random each hour. */
     val sequential: Boolean = true
 ) {
-    /** Deterministic pick for a given hour-of-day when [sequential], otherwise a stable-for-the-hour random pick. */
-    fun genreForHour(hour: Int): String? {
+    /**
+     * Deterministic pick for a given hour-of-day when [sequential]. Otherwise a pick that's
+     * stable *within* that hour (so it doesn't change if the service restarts mid-hour) but
+     * still varies day to day, by folding [daySeed] (e.g. day-of-year) into the random seed -
+     * seeding on hour alone would otherwise pick the exact same "random" genre at, say, 3pm
+     * every single day forever, defeating the point of random mode.
+     */
+    fun genreForHour(hour: Int, daySeed: Int = 0): String? {
         if (genres.isEmpty()) return null
         return if (sequential) {
             genres[hour % genres.size]
         } else {
-            genres[kotlin.random.Random(hour).nextInt(genres.size)]
+            genres[kotlin.random.Random(hour * 31 + daySeed).nextInt(genres.size)]
         }
     }
 
-    fun toSerialized(): String = (if (sequential) "1" else "0") + "\u0001" + genres.joinToString(",")
+    fun toSerialized(): String = (if (sequential) "1" else "0") + "\u0001" + genres.joinToString(",") { it.replace(",", " ").trim() }
 
     companion object {
         val DEFAULT_GENRES = listOf("pop", "hip hop", "rock", "electronic", "chill", "indie", "r&b", "dance")

@@ -75,7 +75,10 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
     /** Finds artists tagged with [genre] via artist search, to widen the pool beyond your existing top artists. */
     suspend fun searchArtistsByGenre(genre: String, limit: Int = 10): Result<List<SpotifyArtist>> = withContext(Dispatchers.IO) {
         runCatching {
-            val query = java.net.URLEncoder.encode("genre:\"$genre\"", "UTF-8")
+            // Strip embedded quotes so a stray " in user-entered genre text can't break out of
+            // the quoted field-filter syntax Spotify's search expects.
+            val sanitizedGenre = genre.replace("\"", "")
+            val query = java.net.URLEncoder.encode("genre:\"$sanitizedGenre\"", "UTF-8")
             val request = authedRequest("https://api.spotify.com/v1/search?q=$query&type=artist&limit=$limit")
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw IOException("Artist search failed: ${response.code}")

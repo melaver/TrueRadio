@@ -4,7 +4,6 @@ import android.content.Context
 import android.media.AudioAttributes as PlatformAudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.os.Build
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -73,34 +72,23 @@ class AudioPlaybackManager(private val context: Context) {
     }
 
     private fun requestDuckingFocus(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val platformAttrs = PlatformAudioAttributes.Builder()
-                .setUsage(PlatformAudioAttributes.USAGE_MEDIA)
-                .setContentType(PlatformAudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(platformAttrs)
-                .setWillPauseWhenDucked(false)
-                .build()
-            focusRequest = request
-            audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(
-                null,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        }
+        // No SDK-version branching needed here: minSdk is already 26 (Build.VERSION_CODES.O),
+        // required by the Spotify App Remote SDK, so the AudioFocusRequest API (added in O) is
+        // always available - a version check here would just be permanently-dead code.
+        val platformAttrs = PlatformAudioAttributes.Builder()
+            .setUsage(PlatformAudioAttributes.USAGE_MEDIA)
+            .setContentType(PlatformAudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(platformAttrs)
+            .setWillPauseWhenDucked(false)
+            .build()
+        focusRequest = request
+        return audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
     }
 
     private fun abandonDuckingFocus() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.abandonAudioFocus(null)
-        }
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
         focusRequest = null
     }
 
