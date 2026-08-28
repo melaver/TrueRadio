@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TrueRadio</string>
+    <string name="notif_channel_name">Radio DJ Playback</string>
+    <string name="notif_channel_desc">Shows current DJ status and playback controls</string>
+</resources>
