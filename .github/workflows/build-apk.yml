@@ -1,0 +1,48 @@
+name: Build debug APK
+
+# Builds on GitHub's own runners, which have full access to the Android SDK, Google's Maven
+# repo, and Gradle's distribution servers - none of which are reachable from the sandbox this
+# project was scaffolded in. Push this repo to GitHub (or run manually from the Actions tab)
+# and download the APK from the workflow run's "Artifacts" section when it finishes.
+#
+# IMPORTANT: this will fail until you add the Spotify App Remote AAR to app/libs/ - see
+# README.md section 1, step 7. It isn't published to Maven, so no CI step can fetch it for you;
+# commit the .aar file to the repo (app/libs/*.aar is gitignored by default - remove that line
+# from .gitignore, or use a CI secret/step to place it there before the build).
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate Gradle wrapper
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrueRadio-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
