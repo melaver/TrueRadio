@@ -29,6 +29,7 @@ import com.trueradio.app.NewsPreferences
 import com.trueradio.app.NewsSource
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.service.RadioForegroundService
+import com.trueradio.app.spotify.SpotifyManager
 import com.trueradio.app.spotify.SpotifyWebAuthManager
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -141,6 +142,29 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startDjService(spotifyClientId: String) {
+        // Spotify App Remote shows a one-time native authorization screen the first time a given
+        // client id connects - which is an Activity launch, requiring a real Activity context to
+        // display. RadioForegroundService's own connection uses applicationContext (correct for
+        // a long-lived Service), but that means the very *first* authorization has nowhere to
+        // show its permission screen from - the SDK doesn't surface a clean error for this, so
+        // the connection just hangs forever with no visible feedback, matching the "notification
+        // says starting, then nothing happens" symptom. Pre-authorizing here first, using this
+        // Activity as context, lets that one-time prompt display correctly. Every subsequent
+        // connection attempt (including the Service's own) then succeeds without needing to show
+        // anything, since Spotify caches the grant once given.
+        val preAuthManager = SpotifyManager(this, spotifyClientId)
+        preAuthManager.connect { _, _ ->
+            // Whether this succeeded or failed, disconnect our temporary Activity-side
+            // connection and let the Service establish its own long-lived one - if
+            // authorization was actually denied (rather than just needing to be shown), the
+            // Service's attempt will fail too, but will correctly report that failure via its
+            // status/notification instead of hanging silently.
+            preAuthManager.disconnect()
+            launchForegroundService(spotifyClientId)
+        }
+    }
+
+    private fun launchForegroundService(spotifyClientId: String) {
         val intent = Intent(this, RadioForegroundService::class.java).apply {
             action = RadioForegroundService.ACTION_START
             putExtra(RadioForegroundService.EXTRA_SPOTIFY_CLIENT_ID, spotifyClientId)
