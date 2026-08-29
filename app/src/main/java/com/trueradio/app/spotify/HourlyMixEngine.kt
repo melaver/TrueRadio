@@ -6,13 +6,15 @@ import com.trueradio.app.SecureSettings
  * Builds the track list for "this hour's genre" out of the user's own Spotify taste data, then
  * writes it into a single reusable private playlist that [SpotifyManager] plays via App Remote.
  *
- * Approach (see [SpotifyWebApiClient] for why this doesn't use `/recommendations`):
+ * Approach (see [SpotifyWebApiClient] for why this doesn't use `/recommendations`, and for the
+ * February 2026 Development Mode endpoint changes this class was updated to follow):
  *  1. Pull the user's top artists + top tracks (this *is* "their algorithm" - it's the same
  *     taste signal Spotify's own Discover/Radio features are built from).
  *  2. Keep the top artists/tracks whose genre tags match this hour's target genre - these go
  *     first in the mix, since they're both genre-correct and personally proven.
- *  3. If that's thin (a genre the user doesn't currently listen to much), widen the pool via
- *     artist search for the genre and pull each match's top tracks.
+ *  3. If that's thin (a genre the user doesn't currently listen to much), widen the pool by
+ *     searching for tracks tagged with the genre directly, paginating via `offset` since search
+ *     results are capped at 10 per call.
  *  4. Shuffle within (not across) those two tiers so personalized picks still lead, write the
  *     result into the hourly playlist, and hand the playlist URI back to the caller to play.
  */
@@ -24,6 +26,7 @@ class HourlyMixEngine(
         private const val PLAYLIST_NAME = "TrueRadio Hourly Mix"
         private const val PLAYLIST_DESCRIPTION = "Auto-updated every hour by TrueRadio - do not add manual tracks, they'll be replaced."
         private const val TARGET_TRACK_COUNT = 30
+        private const val SEARCH_PAGE_SIZE = 10 // Spotify's Feb 2026 search `limit` cap
     }
 
     /**
@@ -67,14 +70,17 @@ class HourlyMixEngine(
 
         val personalizedUris = personalizedTracks.map { it.uri }.shuffled().toMutableList()
 
-        // Tier 2: widen via genre-tagged artist search when the personalized pool is thin.
+        // Tier 2: widen via direct genre-tagged track search when the personalized pool is thin.
+        // Paginated via offset since each call returns at most SEARCH_PAGE_SIZE results.
         if (personalizedUris.size < TARGET_TRACK_COUNT) {
-            val discoveredArtists = webApi.searchArtistsByGenre(genre).getOrDefault(emptyList())
             val discoveredUris = mutableListOf<String>()
-            for (artist in discoveredArtists) {
-                if (personalizedUris.size + discoveredUris.size >= TARGET_TRACK_COUNT) break
-                val artistTracks = webApi.getArtistTopTracks(artist.id).getOrDefault(emptyList())
-                discoveredUris += artistTracks.map { it.uri }
+            var offset = 0
+            while (personalizedUris.size + discoveredUris.size < TARGET_TRACK_COUNT) {
+                val page = webApi.searchTracksByGenre(genre, limit = SEARCH_PAGE_SIZE, offset = offset)
+                    .getOrDefault(emptyList())
+                if (page.isEmpty()) break // no more results available for this genre
+                discoveredUris += page.map { it.uri }
+                offset += page.size
             }
             personalizedUris += discoveredUris.shuffled()
         }
@@ -103,8 +109,9 @@ class HourlyMixEngine(
         val existing = settings.snapshotSpotifyHourlyPlaylistId()
         if (existing.isNotBlank()) return Result.success(existing)
 
-        val userId = webApi.getCurrentUserId().getOrElse { return Result.failure(it) }
-        val playlistId = webApi.createPlaylist(userId, PLAYLIST_NAME, PLAYLIST_DESCRIPTION)
+        // POST /me/playlists (current, post-Feb-2026 endpoint) infers the user from the access
+        // token, so no separate "get current user id" lookup is needed first.
+        val playlistId = webApi.createPlaylist(PLAYLIST_NAME, PLAYLIST_DESCRIPTION)
             .getOrElse { return Result.failure(it) }
         settings.saveSpotifyHourlyPlaylistId(playlistId)
         return Result.success(playlistId)

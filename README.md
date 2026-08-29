@@ -167,19 +167,34 @@ grant and scopes.
 **Important - `/recommendations` is dead:** Spotify permanently deprecated the
 `GET /v1/recommendations` endpoint (and `audio-features`/`audio-analysis`) for all apps created
 after November 27, 2024 - it now 404s for new API clients with no replacement. Older tutorials
-and sample code that build a "genre + seed tracks" recommendation this way no longer work. This
-app instead:
+and sample code that build a "genre + seed tracks" recommendation this way no longer work.
+
+**Important - the February 2026 Development Mode migration:** Spotify also restricted several
+more endpoints for apps in Development Mode (see
+[the official migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)),
+three of which this feature depends on:
+- `POST /users/{user_id}/playlists` (create playlist) → returns **403 for every caller** now;
+  replaced by `POST /me/playlists`. If you see "create playlist failed 403", this is why - it
+  means you're on a build from before this fix, not a setup problem on your end.
+- `PUT /playlists/{id}/tracks` (replace playlist contents) → renamed to
+  `PUT /playlists/{id}/items`.
+- `GET /artists/{id}/top-tracks` → **removed entirely, no replacement.** The original widening
+  strategy ("search artists by genre, then fetch each one's top tracks") depended on this and
+  would fail on every call post-migration.
+
+This app now:
 1. Reads your real top artists/tracks (`/v1/me/top/artists`, `/v1/me/top/tracks`) - this **is**
    Spotify's own taste model's output for you.
 2. Filters those to the ones tagged with the current hour's target genre (artist objects still
    carry genre tags).
-3. If that's thin for a genre you don't listen to much yet, widens the pool via artist search
-   (`/v1/search?q=genre:"..."`) and pulls each match's top tracks - both endpoints remain live.
-4. Writes the result into one reusable private playlist (`TrueRadio Hourly Mix`) and tells
-   Spotify to play it via App Remote.
+3. If that's thin for a genre you don't listen to much yet, widens the pool by searching for
+   *tracks* tagged with the genre directly (`/v1/search?q=genre:"..."&type=track`), paginating
+   via `offset` since the Feb 2026 migration also capped search `limit` at 10 (was 50).
+4. Writes the result into one reusable private playlist (`TrueRadio Hourly Mix`, created via
+   `POST /me/playlists`) and tells Spotify to play it via App Remote.
 
 See `HourlyMixEngine.kt` and `SpotifyWebApiClient.kt` for the exact implementation, and revisit
-them if Spotify's API surface changes again - it's shifted several times.
+them if Spotify's API surface changes again - it's shifted more than once already.
 
 ### Setup
 

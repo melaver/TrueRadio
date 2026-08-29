@@ -20,11 +20,24 @@ data class SpotifyTrack(val uri: String, val name: String, val artistName: Strin
  *
  * IMPORTANT: this deliberately does NOT call `GET /v1/recommendations` or use
  * `audio-features`/`audio-analysis` - Spotify deprecated those endpoints for all apps created
- * after November 27, 2024, and access was not restored; they now 404 for new API clients. This
- * class instead composes the same outcome from endpoints that remain generally available:
- * your top artists/tracks (the actual output of Spotify's own taste model for you), genre tags
- * on artist objects, artist search, and per-artist top tracks - then the caller blends and
- * shuffles the results itself. If Spotify changes availability again, this is the file to revisit.
+ * after November 27, 2024, and access was not restored; they now 404 for new API clients.
+ *
+ * It also follows Spotify's February 2026 Development Mode migration
+ * (developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide), which
+ * changed several endpoints this app depends on:
+ *  - `POST /users/{user_id}/playlists` (create playlist) was replaced by `POST /me/playlists` -
+ *    the old endpoint now returns 403 for every Development Mode caller, which is what a
+ *    "create playlist failed 403" error means.
+ *  - `PUT /playlists/{id}/tracks` (replace playlist contents) was renamed to
+ *    `PUT /playlists/{id}/items`.
+ *  - `GET /artists/{id}/top-tracks` was removed entirely with **no replacement**. The old
+ *    "search artists by genre, then fetch each one's top tracks" widening approach used that
+ *    endpoint and would 404 on every call post-migration; it's been replaced with searching for
+ *    *tracks* by genre directly ([searchTracksByGenre]), which remains available (search itself
+ *    wasn't removed, only its `limit` cap was reduced from 50 to 10 - handled here by clamping
+ *    and paginating via `offset` instead of requesting a larger page).
+ *
+ * If Spotify changes Web API availability again, this is the file to revisit.
  */
 class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
 
@@ -38,16 +51,6 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
     private suspend fun authedRequest(url: String): Request {
         val token = authManager.getValidAccessToken().getOrThrow()
         return Request.Builder().url(url).addHeader("Authorization", "Bearer $token").build()
-    }
-
-    suspend fun getCurrentUserId(): Result<String> = withContext(Dispatchers.IO) {
-        runCatching {
-            val request = authedRequest("https://api.spotify.com/v1/me")
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("Get current user failed: ${response.code}")
-                JSONObject(response.body?.string().orEmpty()).getString("id")
-            }
-        }
     }
 
     /** Your top artists (medium_term = ~last 6 months), each with the genre tags Spotify assigns them. */
@@ -72,35 +75,37 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
         }
     }
 
-    /** Finds artists tagged with [genre] via artist search, to widen the pool beyond your existing top artists. */
-    suspend fun searchArtistsByGenre(genre: String, limit: Int = 10): Result<List<SpotifyArtist>> = withContext(Dispatchers.IO) {
+    /**
+     * Searches for tracks tagged with [genre] directly. Replaces the old "search artists by
+     * genre, then fetch each artist's top tracks" approach - see the class-level doc comment for
+     * why. [offset] supports pagination since the search `limit` cap is now 10 (was 50), so
+     * gathering more than 10 results requires multiple calls.
+     */
+    suspend fun searchTracksByGenre(genre: String, limit: Int = 10, offset: Int = 0): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
         runCatching {
             // Strip embedded quotes so a stray " in user-entered genre text can't break out of
             // the quoted field-filter syntax Spotify's search expects.
             val sanitizedGenre = genre.replace("\"", "")
             val query = java.net.URLEncoder.encode("genre:\"$sanitizedGenre\"", "UTF-8")
-            val request = authedRequest("https://api.spotify.com/v1/search?q=$query&type=artist&limit=$limit")
+            val clampedLimit = limit.coerceIn(1, 10) // Spotify's Feb 2026 search limit cap
+            val request = authedRequest(
+                "https://api.spotify.com/v1/search?q=$query&type=track&limit=$clampedLimit&offset=$offset"
+            )
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("Artist search failed: ${response.code}")
-                val artistsObj = JSONObject(response.body?.string().orEmpty()).getJSONObject("artists")
-                parseArtists(artistsObj.getJSONArray("items"))
+                if (!response.isSuccessful) throw IOException("Track search failed: ${response.code}")
+                val tracksObj = JSONObject(response.body?.string().orEmpty()).getJSONObject("tracks")
+                parseTracks(tracksObj.getJSONArray("items"))
             }
         }
     }
 
-    /** Top tracks for a specific artist - still a live, non-deprecated endpoint. */
-    suspend fun getArtistTopTracks(artistId: String, market: String = "US"): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
-        runCatching {
-            val request = authedRequest("https://api.spotify.com/v1/artists/$artistId/top-tracks?market=$market")
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("Artist top tracks failed: ${response.code}")
-                parseTracks(JSONObject(response.body?.string().orEmpty()).getJSONArray("tracks"))
-            }
-        }
-    }
-
-    /** Creates a new private playlist and returns its id. Call once and persist the id; reuse via [replacePlaylistTracks]. */
-    suspend fun createPlaylist(userId: String, name: String, description: String): Result<String> = withContext(Dispatchers.IO) {
+    /**
+     * Creates a new private playlist for the current user and returns its id. Call once and
+     * persist the id; reuse via [replacePlaylistTracks]. Uses `POST /me/playlists` (the
+     * February-2026-current endpoint) rather than the removed `POST /users/{user_id}/playlists`,
+     * so no user id needs to be resolved first.
+     */
+    suspend fun createPlaylist(name: String, description: String): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             val token = authManager.getValidAccessToken().getOrThrow()
             val payload = JSONObject().apply {
@@ -110,7 +115,7 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
             }
             val body = payload.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
-                .url("https://api.spotify.com/v1/users/$userId/playlists")
+                .url("https://api.spotify.com/v1/me/playlists")
                 .addHeader("Authorization", "Bearer $token")
                 .post(body)
                 .build()
@@ -121,14 +126,20 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
         }
     }
 
-    /** Replaces a playlist's full track list in one call - used every hour to swap in the new genre's mix. */
+    /**
+     * Replaces a playlist's full track list in one call - used every hour to swap in the new
+     * genre's mix. Uses `PUT /playlists/{id}/items` (the February-2026-current endpoint) rather
+     * than the renamed-away `PUT /playlists/{id}/tracks`. The request body's `uris` field name
+     * is unchanged by that migration - only the URL path segment and this endpoint's response
+     * field naming for reads were affected, per Spotify's migration guide.
+     */
     suspend fun replacePlaylistTracks(playlistId: String, trackUris: List<String>): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val token = authManager.getValidAccessToken().getOrThrow()
             val payload = JSONObject().apply { put("uris", JSONArray(trackUris)) }
             val body = payload.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder()
-                .url("https://api.spotify.com/v1/playlists/$playlistId/tracks")
+                .url("https://api.spotify.com/v1/playlists/$playlistId/items")
                 .addHeader("Authorization", "Bearer $token")
                 .put(body)
                 .build()
