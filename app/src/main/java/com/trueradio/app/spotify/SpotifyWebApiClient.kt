@@ -76,10 +76,37 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
     }
 
     /**
+     * Searches an artist's catalog directly via general search rather than the now-removed
+     * `GET /artists/{id}/top-tracks` endpoint. Used to pull *more* tracks from an artist the user
+     * already listens to (beyond whatever happened to land in their top-tracks snapshot), which
+     * is a much stronger "this will actually be recognizable" signal than genre-only search
+     * turning up an unfamiliar artist who merely shares the tag - especially now that Spotify
+     * removed the `popularity` field from track/artist objects, so there's no numeric popularity
+     * signal left to sort by directly.
+     */
+    suspend fun searchTracksByArtist(artistName: String, limit: Int = 10, offset: Int = 0): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val sanitizedName = artistName.replace("\"", "")
+            val query = java.net.URLEncoder.encode("artist:\"$sanitizedName\"", "UTF-8")
+            val clampedLimit = limit.coerceIn(1, 10) // Spotify's Feb 2026 search limit cap
+            val request = authedRequest(
+                "https://api.spotify.com/v1/search?q=$query&type=track&limit=$clampedLimit&offset=$offset"
+            )
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Artist track search failed: ${response.code}")
+                val tracksObj = JSONObject(response.body?.string().orEmpty()).getJSONObject("tracks")
+                parseTracks(tracksObj.getJSONArray("items"))
+            }
+        }
+    }
+
+    /**
      * Searches for tracks tagged with [genre] directly. Replaces the old "search artists by
      * genre, then fetch each artist's top tracks" approach - see the class-level doc comment for
      * why. [offset] supports pagination since the search `limit` cap is now 10 (was 50), so
-     * gathering more than 10 results requires multiple calls.
+     * gathering more than 10 results requires multiple calls. This is the last-resort tier in
+     * [HourlyMixEngine] since it can surface artists the user has never heard of - prefer
+     * [searchTracksByArtist] against the user's own top artists first.
      */
     suspend fun searchTracksByGenre(genre: String, limit: Int = 10, offset: Int = 0): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
         runCatching {

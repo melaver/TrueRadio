@@ -31,7 +31,13 @@ class GeminiClient(private val apiKey: String) {
     }
 
     companion object {
-        private const val MODEL = "gemini-2.5-flash"
+        // "gemini-flash-latest" is a rolling alias Google maintains that always points to their
+        // current default/recommended Flash model - used instead of a specific dated model id
+        // (the original "gemini-2.5-flash" started returning 404 for newly-created API keys as
+        // Google phases it out ahead of its Oct 16, 2026 shutdown, even though the docs still
+        // listed it as "available" for a while). This avoids the same problem recurring every
+        // few months as Google's Flash lineup keeps advancing (2.5 -> 3.5 -> 3.6 -> 3.7 -> ...).
+        private const val MODEL = "gemini-flash-latest"
         private const val ENDPOINT_TEMPLATE =
             "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
 
