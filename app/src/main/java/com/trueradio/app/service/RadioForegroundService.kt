@@ -87,12 +87,22 @@ class RadioForegroundService : LifecycleService() {
     private val _status = MutableStateFlow("Idle")
     val status: StateFlow<String> get() = _status
 
+    // The notification is the ONLY thing an end user can actually see once the DJ is running -
+    // there's no bound-service/UI wiring to `status` above, so without this, every one of the
+    // many updateStatus(...) calls throughout this file (connection failures, news-fetch
+    // failures, genre-mix build failures, etc.) would update an internal StateFlow that nothing
+    // ever reads, leaving failures completely invisible ("nothing happens" with no way to tell
+    // why). Both pieces of state below feed the same notification: title = current track,
+    // text = latest status message - so failures actually surface somewhere the user can see.
+    private var lastKnownTrackLabel: String = "Starting up..."
+    private var lastKnownIsPaused: Boolean = false
+
     override fun onCreate() {
         super.onCreate()
         settings = SecureSettings(applicationContext)
         newsRepository = NewsRepository()
         audioPlaybackManager = AudioPlaybackManager(applicationContext)
-        startForeground(NOTIFICATION_ID, buildNotification("Starting up...", isPaused = false))
+        startForeground(NOTIFICATION_ID, buildNotification(lastKnownTrackLabel, _status.value, isPaused = false))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -332,15 +342,22 @@ class RadioForegroundService : LifecycleService() {
 
     private fun updateStatus(message: String) {
         _status.value = message
+        refreshNotification()
     }
 
     private fun updateNotification(trackLabel: String, isPaused: Boolean) {
-        val notification = buildNotification(trackLabel, isPaused)
+        lastKnownTrackLabel = trackLabel
+        lastKnownIsPaused = isPaused
+        refreshNotification()
+    }
+
+    private fun refreshNotification() {
+        val notification = buildNotification(lastKnownTrackLabel, _status.value, isPaused = lastKnownIsPaused)
         val manager = getSystemService(android.app.NotificationManager::class.java)
         manager.notify(NOTIFICATION_ID, notification)
     }
 
-    private fun buildNotification(contentText: String, isPaused: Boolean): Notification {
+    private fun buildNotification(trackLabel: String, statusText: String, isPaused: Boolean): Notification {
         val openAppIntent = Intent(this, MainActivity::class.java)
         val contentPendingIntent = PendingIntent.getActivity(
             this, 0, openAppIntent,
@@ -361,8 +378,9 @@ class RadioForegroundService : LifecycleService() {
 
         return NotificationCompat.Builder(this, RadioApplication.NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(contentText)
+            .setContentTitle(trackLabel)
+            .setContentText(statusText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText("$trackLabel\n$statusText"))
             .setContentIntent(contentPendingIntent)
             .setOngoing(true)
             .addAction(

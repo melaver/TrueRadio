@@ -185,6 +185,11 @@ data class GenreRotation(
     }
 }
 
+/** User's preferred UI appearance. SYSTEM follows the device's light/dark setting automatically. */
+enum class ThemeMode {
+    LIGHT, DARK, SYSTEM
+}
+
 /** High-level state the UI observes. */
 data class DjUiState(
     val isConnectedToSpotify: Boolean = false,

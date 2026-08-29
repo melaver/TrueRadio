@@ -1,6 +1,5 @@
 package com.trueradio.app.ai
 
-import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType

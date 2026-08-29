@@ -33,6 +33,7 @@ class SecureSettings(private val context: Context) {
         val SPOTIFY_WEB_TOKEN_EXPIRES_AT = stringPreferencesKey("spotify_web_token_expires_at") // epoch millis, as string
         val SPOTIFY_HOURLY_PLAYLIST_ID = stringPreferencesKey("spotify_hourly_playlist_id")
         val SPOTIFY_PKCE_CODE_VERIFIER = stringPreferencesKey("spotify_pkce_code_verifier") // transient, cleared after token exchange
+        val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -54,6 +55,9 @@ class SecureSettings(private val context: Context) {
     val spotifyWebRefreshToken: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_WEB_REFRESH_TOKEN] ?: "" }
     val spotifyWebTokenExpiresAt: Flow<Long> = context.dataStore.data.map { it[Keys.SPOTIFY_WEB_TOKEN_EXPIRES_AT]?.toLongOrNull() ?: 0L }
     val spotifyHourlyPlaylistId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_HOURLY_PLAYLIST_ID] ?: "" }
+    val themeMode: Flow<ThemeMode> = context.dataStore.data.map { prefs ->
+        ThemeMode.entries.firstOrNull { it.name == prefs[Keys.THEME_MODE] } ?: ThemeMode.SYSTEM
+    }
 
     suspend fun saveAll(spotifyClientId: String, geminiKey: String, elevenLabsKey: String, elevenLabsVoiceId: String) {
         context.dataStore.edit { prefs ->
@@ -106,6 +110,10 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.SPOTIFY_HOURLY_PLAYLIST_ID] = playlistId }
     }
 
+    suspend fun saveThemeMode(mode: ThemeMode) {
+        context.dataStore.edit { prefs -> prefs[Keys.THEME_MODE] = mode.name }
+    }
+
     suspend fun snapshotGeminiKey(): String = geminiApiKey.first()
     suspend fun snapshotElevenLabsKey(): String = elevenLabsApiKey.first()
     suspend fun snapshotElevenLabsVoiceId(): String = elevenLabsVoiceId.first()
@@ -116,4 +124,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotSpotifyWebRefreshToken(): String = spotifyWebRefreshToken.first()
     suspend fun snapshotSpotifyWebTokenExpiresAt(): Long = spotifyWebTokenExpiresAt.first()
     suspend fun snapshotSpotifyHourlyPlaylistId(): String = spotifyHourlyPlaylistId.first()
+    suspend fun snapshotThemeMode(): ThemeMode = themeMode.first()
 }

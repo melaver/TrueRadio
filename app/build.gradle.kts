@@ -81,25 +81,31 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
+    // Explicit rather than relying on it coming transitively via activity-compose: this is the
+    // first time this codebase's Kotlin has ever actually reached the compiler (both prior CI
+    // failures were earlier in the pipeline - Gradle config, then resource linking) - safer to
+    // declare it directly than assume a transitive dependency for the rememberSaveable() used
+    // in MainActivity.kt.
+    implementation("androidx.compose.runtime:runtime-saveable")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Networking (Retrofit + OkHttp) for Gemini / ElevenLabs / RSS
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.squareup.retrofit2:converter-gson:2.11.0")
-    implementation("com.squareup.retrofit2:converter-scalars:2.11.0")
+    // Networking (OkHttp) for Gemini / ElevenLabs / RSS / Spotify Web API
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // XML/RSS parsing
     implementation("org.jsoup:jsoup:1.17.2") // tolerant XML/HTML parsing used for RSS
 
+    // Gson: used directly by GeminiClient and TtsManager (request/response JSON), not just as
+    // converter-gson's transitive dependency - declared explicitly rather than relying on that.
+    implementation("com.google.code.gson:gson:2.11.0")
+
     // Media3 / ExoPlayer for local ducked TTS playback
     implementation("androidx.media3:media3-exoplayer:1.4.0")
     implementation("androidx.media3:media3-common:1.4.0")
-    implementation("androidx.media3:media3-session:1.4.0")
 
     // Spotify App Remote SDK (place spotify-app-remote-release-x.x.x.aar in app/libs,
     // see README for download instructions from developer.spotify.com)

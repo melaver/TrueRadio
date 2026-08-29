@@ -28,9 +28,11 @@ import com.trueradio.app.NewsCategory
 import com.trueradio.app.NewsPreferences
 import com.trueradio.app.NewsSource
 import com.trueradio.app.SecureSettings
+import com.trueradio.app.ThemeMode
 import com.trueradio.app.service.RadioForegroundService
 import com.trueradio.app.spotify.SpotifyManager
 import com.trueradio.app.spotify.SpotifyWebAuthManager
+import com.trueradio.app.ui.theme.TrueRadioTheme
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -47,6 +49,13 @@ class MainActivity : ComponentActivity() {
     // button permanently disabled with no way to retry.
     private val isConnectingSpotifyWebState = mutableStateOf(false)
 
+    // Tracks a pending pre-authorization SpotifyManager (see startDjService) so it can be
+    // disconnected in onDestroy() if the Activity is torn down before its connect() callback
+    // ever fires - e.g. "Don't keep activities" enabled, memory pressure, or the SDK genuinely
+    // hanging. Without this, that instance (and the Activity Context it holds via SpotifyManager)
+    // would stay referenced by the pending callback closure for the rest of the process's life.
+    private var pendingPreAuthManager: SpotifyManager? = null
+
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
 
@@ -57,7 +66,8 @@ class MainActivity : ComponentActivity() {
         refreshWebApiConnectedState()
 
         setContent {
-            MaterialTheme {
+            val themeMode by settings.themeMode.collectAsState(initial = ThemeMode.SYSTEM)
+            TrueRadioTheme(themeMode = themeMode) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     DjScreen(
                         settings = settings,
@@ -83,6 +93,12 @@ class MainActivity : ComponentActivity() {
         // and "user backed out of the browser without finishing" (plain onResume, no new intent -
         // this is the case that actually needs the reset, so the button isn't stuck disabled).
         isConnectingSpotifyWebState.value = false
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        pendingPreAuthManager?.disconnect()
+        pendingPreAuthManager = null
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -153,6 +169,7 @@ class MainActivity : ComponentActivity() {
         // connection attempt (including the Service's own) then succeeds without needing to show
         // anything, since Spotify caches the grant once given.
         val preAuthManager = SpotifyManager(this, spotifyClientId)
+        pendingPreAuthManager = preAuthManager
         preAuthManager.connect { _, _ ->
             // Whether this succeeded or failed, disconnect our temporary Activity-side
             // connection and let the Service establish its own long-lived one - if
@@ -160,6 +177,7 @@ class MainActivity : ComponentActivity() {
             // Service's attempt will fail too, but will correctly report that failure via its
             // status/notification instead of hanging silently.
             preAuthManager.disconnect()
+            pendingPreAuthManager = null
             launchForegroundService(spotifyClientId)
         }
     }
@@ -203,6 +221,7 @@ fun DjScreen(
     val savedElevenLabsVoiceId by settings.elevenLabsVoiceId.collectAsState(initial = "")
     val savedNewsPreferences by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val savedGenreRotation by settings.genreRotation.collectAsState(initial = GenreRotation())
+    val themeMode by settings.themeMode.collectAsState(initial = ThemeMode.SYSTEM)
 
     var spotifyClientId by remember(savedSpotifyId) { mutableStateOf(savedSpotifyId) }
     var geminiKey by remember(savedGeminiKey) { mutableStateOf(savedGeminiKey) }
@@ -247,6 +266,21 @@ fun DjScreen(
             "Status: ${if (isRunning) "On air" else "Idle"}",
             style = MaterialTheme.typography.bodyMedium
         )
+
+        Text("Appearance", style = MaterialTheme.typography.labelLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                ThemeMode.SYSTEM to "System",
+                ThemeMode.LIGHT to "Light",
+                ThemeMode.DARK to "Dark"
+            ).forEach { (mode, label) ->
+                FilterChip(
+                    selected = themeMode == mode,
+                    onClick = { scope.launch { settings.saveThemeMode(mode) } },
+                    label = { Text(label) }
+                )
+            }
+        }
 
         OutlinedTextField(
             value = spotifyClientId,
