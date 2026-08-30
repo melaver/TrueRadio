@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Applies automatically when the system is in dark mode, so the native window
-         background/status bar matches before Compose's own theme (see ui/theme/Theme.kt) takes
-         over for the actual content. Only follows the system setting, same as any values-night
-         resource - a manual in-app Light/Dark override doesn't retroactively affect this first
-         native frame; see the note in Theme.kt. -->
-    <style name="Theme.TrueRadio" parent="android:Theme.Material.NoActionBar" />
+    <!-- Dark walnut cabinet, matching the dark scheme's background. -->
+    <style name="Theme.TrueRadio" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#2E1F17</item>
+    </style>
 </resources>

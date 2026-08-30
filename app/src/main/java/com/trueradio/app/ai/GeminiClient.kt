@@ -45,6 +45,8 @@ class GeminiClient(
      */
     private val artistListCache = mutableMapOf<String, List<String>>()
 
+
+
     private val client: OkHttpClient by lazy {
         val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
         OkHttpClient.Builder()
@@ -56,6 +58,21 @@ class GeminiClient(
 
     companion object {
         private const val TAG = "GeminiClient"
+
+        /**
+         * Process-wide 429 backoff. Retrying into a rate limit makes it WORSE - every retry
+         * counts against the same quota - so once Gemini returns 429, all calls are refused
+         * locally until this expires. Failing instantly also beats three slow retries that end
+         * in silence anyway.
+         */
+        @Volatile
+        private var rateLimitedUntilMs = 0L
+        private const val RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000L
+
+        fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntilMs
+        fun rateLimitSecondsRemaining(): Long =
+            ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
+        private fun tripRateLimit() { rateLimitedUntilMs = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS }
 
         /**
          * Rolling alias Google maintains pointing at their current recommended Flash model, used
@@ -84,7 +101,9 @@ class GeminiClient(
          */
         private const val MAX_ATTEMPTS = 3
         private const val INITIAL_BACKOFF_MS = 1_000L
-        private val RETRYABLE_CODES = setOf(429, 500, 502, 503, 504)
+        // 429 deliberately excluded: it's a quota limit, handled by the circuit breaker above.
+        // Retrying it just consumes more quota.
+        private val RETRYABLE_CODES = setOf(500, 502, 503, 504)
 
         // Gemini TTS output format, fixed by the API contract - used to build the WAV header.
         private const val TTS_SAMPLE_RATE = 24_000
@@ -227,6 +246,10 @@ class GeminiClient(
      * lockstep and hit the overloaded backend at the same instant.
      */
     private suspend fun <T> withRetries(label: String, block: suspend () -> Result<T>): Result<T> {
+        if (isRateLimited()) {
+            Log.w(TAG, "[$label] skipped - rate limited for another ${rateLimitSecondsRemaining()}s")
+            return Result.failure(IOException("Gemini rate limited (${rateLimitSecondsRemaining()}s remaining)"))
+        }
         var lastFailure: Throwable? = null
         repeat(MAX_ATTEMPTS) { attempt ->
             val result = block()
@@ -234,6 +257,13 @@ class GeminiClient(
 
             val error = result.exceptionOrNull()
             lastFailure = error
+            // A 429 means quota, not transient load - stop retrying immediately and lock out
+            // further calls, otherwise the retries deepen the hole.
+            if (error?.message?.contains("429") == true) {
+                tripRateLimit()
+                Log.e(TAG, "[$label] RATE LIMITED (429) - pausing all Gemini calls for 5 minutes")
+                return Result.failure(error)
+            }
             val retryable = (error as? RetryableHttpException) != null
             if (!retryable || attempt == MAX_ATTEMPTS - 1) {
                 if (!retryable) Log.e(TAG, "[$label] non-retryable failure; giving up", error)

@@ -38,6 +38,8 @@ class SecureSettings(private val context: Context) {
         val TRACK_FEEDBACK = stringPreferencesKey("track_feedback")
         val GENRE_ANCHORS = stringPreferencesKey("genre_anchors")
         val SONG_LANGUAGE = stringPreferencesKey("song_language")
+        val TUNED_GENRE_OVERRIDE = stringPreferencesKey("tuned_genre_override")
+        val DJ_EVERY_N_TRACKS = stringPreferencesKey("dj_every_n_tracks")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -75,6 +77,14 @@ class SecureSettings(private val context: Context) {
     /** Empty set = no language preference; see SongLanguage.promptClause. */
     val songLanguages: Flow<Set<SongLanguage>> = context.dataStore.data.map { prefs ->
         SongLanguage.fromNames(prefs[Keys.SONG_LANGUAGE] ?: "")
+    }
+    /**
+     * Speak between every Nth track. Each DJ segment costs a Gemini TTS call, so this is the most
+     * direct lever on quota usage - and a DJ that talks after every single song is arguably too
+     * chatty for a radio station anyway. Default 2.
+     */
+    val djEveryNTracks: Flow<Int> = context.dataStore.data.map {
+        it[Keys.DJ_EVERY_N_TRACKS]?.toIntOrNull()?.coerceIn(1, 10) ?: 2
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -147,6 +157,21 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.GENRE_ANCHORS] = anchors.serialize() }
     }
 
+    /** One-shot: the genre the user tuned to before pressing start. Consumed by the service. */
+    suspend fun saveTunedGenreOverride(genre: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.TUNED_GENRE_OVERRIDE] = genre }
+    }
+
+    suspend fun consumeTunedGenreOverride(): String? {
+        val value = context.dataStore.data.map { it[Keys.TUNED_GENRE_OVERRIDE] }.first()
+        if (value != null) context.dataStore.edit { it.remove(Keys.TUNED_GENRE_OVERRIDE) }
+        return value
+    }
+
+    suspend fun saveDjEveryNTracks(n: Int) {
+        context.dataStore.edit { prefs -> prefs[Keys.DJ_EVERY_N_TRACKS] = n.coerceIn(1, 10).toString() }
+    }
+
     suspend fun saveSongLanguages(languages: Set<SongLanguage>) {
         context.dataStore.edit { prefs ->
             prefs[Keys.SONG_LANGUAGE] = languages.joinToString(",") { it.name }
@@ -172,4 +197,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotTrackFeedback(): TrackFeedback = trackFeedback.first()
     suspend fun snapshotGenreAnchors(): GenreAnchors = genreAnchors.first()
     suspend fun snapshotSongLanguages(): Set<SongLanguage> = songLanguages.first()
+    suspend fun snapshotDjEveryNTracks(): Int = djEveryNTracks.first()
 }

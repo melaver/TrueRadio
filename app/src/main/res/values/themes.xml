@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.TrueRadio" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Champagne faceplate, so the first frame before Compose draws matches the light theme. -->
+    <style name="Theme.TrueRadio" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#E0DACA</item>
+    </style>
 </resources>

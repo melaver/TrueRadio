@@ -160,10 +160,39 @@ class HourlyMixEngine(
 
         // Genre matching is via artist tags: Spotify tags artists, not tracks, and removed the
         // per-track `popularity` field, so an artist's tags are the only genre signal left.
-        val genreArtists = allTopArtists.filter { a -> a.genres.any { it.lowercase().contains(genreLower) } }
+        /**
+         * Genre tag matching, deliberately loose.
+         *
+         * Spotify's artist tags are hyper-specific ("permanent wave", "float house", "escape
+         * room"), so a strict `tag.contains("rock")` test matched almost nothing - which left the
+         * personal tiers empty and silently pushed the whole mix onto generic search. That is why
+         * the playlist stopped feeling like it came from the user's account.
+         *
+         * Now matches if either string contains the other, or if they share any word - so "rock"
+         * matches "permanent wave"? No, but it does match "art rock", "indie rock", "rock and
+         * roll", which is the realistic case. Word-level overlap also catches "hip hop" vs
+         * "conscious hip hop".
+         */
+        fun tagMatches(tag: String): Boolean {
+            val t = tag.lowercase()
+            if (t.contains(genreLower) || genreLower.contains(t)) return true
+            val genreWords = genreLower.split(" ", "-", "&").filter { it.length > 2 }.toSet()
+            val tagWords = t.split(" ", "-", "&").filter { it.length > 2 }.toSet()
+            return genreWords.isNotEmpty() && genreWords.intersect(tagWords).isNotEmpty()
+        }
+
+        val genreArtists = allTopArtists.filter { a -> a.genres.any { tagMatches(it) } }
         val genreArtistNames = genreArtists.map { it.name }.toSet()
         fun matchesGenre(track: SpotifyTrack) =
             genreArtistNames.any { it.equals(track.artistName, ignoreCase = true) }
+
+        // All artists the user actually listens to, regardless of tag - used as the fallback
+        // below when genre matching still comes up short.
+        val allTopArtistNames = allTopArtists.map { it.name }.toSet()
+        fun isPersonalArtist(track: SpotifyTrack) =
+            allTopArtistNames.any { it.equals(track.artistName, ignoreCase = true) }
+
+        Log.d(TAG, "Genre '$genre' matched ${genreArtists.size}/${allTopArtists.size} of your top artists")
 
         val quota = { share: Double -> (TARGET_TRACK_COUNT * share).toInt().coerceAtLeast(1) }
 
@@ -236,6 +265,23 @@ class HourlyMixEngine(
 
         val curated = (savedTier + topTier + anchorTier.shuffled() + deepTier.shuffled() + discoveryTier)
             .distinct().toMutableList()
+
+        // Personal fallback, BEFORE any generic search. If genre matching left the mix thin (a
+        // genre whose Spotify tags don't line up with this user's artists), fill from their own
+        // saved and top tracks regardless of tag. A track the user actually listens to is a far
+        // better outcome than a tag-correct track by a stranger - the point of linking the
+        // account is that the music feels like theirs.
+        if (curated.size < TARGET_TRACK_COUNT) {
+            val personalFallback = (savedTracks + allTopTracks)
+                .filter { allowed(it) && (isPersonalArtist(it) || it in savedTracks) }
+                .map { it.uri }
+                .filterNot { it in curated }
+                .shuffled()
+            if (personalFallback.isNotEmpty()) {
+                Log.d(TAG, "Personal fallback contributing ${minOf(personalFallback.size, TARGET_TRACK_COUNT - curated.size)} tracks")
+                curated += personalFallback.take(TARGET_TRACK_COUNT - curated.size)
+            }
+        }
 
         // --- Tier 5: genre-search fill, only if the personal tiers came up short
         if (curated.size < TARGET_TRACK_COUNT) {

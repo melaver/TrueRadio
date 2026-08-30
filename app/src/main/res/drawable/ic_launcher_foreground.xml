@@ -1,33 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Launcher icon: the lit blue tuning window of a silver-face receiver, with tick marks and an
+  amber needle. Drawn inside the central 66x66dp safe zone of the 108x108dp adaptive canvas so
+  round, squircle and square masks all crop cleanly.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Center dot -->
+
+    <!-- Dial window body -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M54,54m-8,0a8,8 0,1 1,16 0a8,8 0,1 1,-16 0" />
-    <!-- Inner arc -->
+        android:fillColor="#0E3A5F"
+        android:pathData="M24,38 L84,38 A3,3 0 0 1 87,41 L87,67 A3,3 0 0 1 84,70 L24,70 A3,3 0 0 1 21,67 L21,41 A3,3 0 0 1 24,38 Z" />
+    <!-- Inner glow -->
     <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="4"
-        android:strokeLineCap="round"
-        android:pathData="M38,38 A22.6,22.6 0,0 1,70 38" />
+        android:fillColor="#155080"
+        android:pathData="M26,44 L82,44 L82,58 L26,58 Z" />
+
+    <!-- Frequency scale: major ticks -->
+    <path android:fillColor="#4FA8D8" android:pathData="M29,46 L30.5,46 L30.5,55 L29,55 Z" />
+    <path android:fillColor="#4FA8D8" android:pathData="M42,46 L43.5,46 L43.5,55 L42,55 Z" />
+    <path android:fillColor="#4FA8D8" android:pathData="M55,46 L56.5,46 L56.5,55 L55,55 Z" />
+    <path android:fillColor="#4FA8D8" android:pathData="M68,46 L69.5,46 L69.5,55 L68,55 Z" />
+    <path android:fillColor="#4FA8D8" android:pathData="M79,46 L80.5,46 L80.5,55 L79,55 Z" />
+    <!-- Minor ticks -->
+    <path android:fillColor="#3A82AC" android:pathData="M35.5,46 L36.5,46 L36.5,51 L35.5,51 Z" />
+    <path android:fillColor="#3A82AC" android:pathData="M48.5,46 L49.5,46 L49.5,51 L48.5,51 Z" />
+    <path android:fillColor="#3A82AC" android:pathData="M61.5,46 L62.5,46 L62.5,51 L61.5,51 Z" />
+    <path android:fillColor="#3A82AC" android:pathData="M74,46 L75,46 L75,51 L74,51 Z" />
+
+    <!-- Amber tuning needle -->
     <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="4"
-        android:strokeLineCap="round"
-        android:pathData="M38,70 A22.6,22.6 0,0 0,70 70" />
-    <!-- Outer arc -->
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="4"
-        android:strokeLineCap="round"
-        android:pathData="M25,25 A41,41 0,0 1,83 25" />
-    <path
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="4"
-        android:strokeLineCap="round"
-        android:pathData="M25,83 A41,41 0,0 0,83 83" />
+        android:fillColor="#FFC65C"
+        android:pathData="M58.5,42 L61,42 L61,66 L58.5,66 Z" />
+
+    <!-- Faceplate trim lines above and below the window -->
+    <path android:fillColor="#9A9484" android:pathData="M21,32 L87,32 L87,34 L21,34 Z" />
+    <path android:fillColor="#9A9484" android:pathData="M21,74 L87,74 L87,76 L21,76 Z" />
 </vector>

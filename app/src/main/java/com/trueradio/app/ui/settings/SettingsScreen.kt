@@ -53,6 +53,7 @@ fun SettingsScreen(
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
     val songLanguages by settings.songLanguages.collectAsState(initial = emptySet())
+    val djEveryN by settings.djEveryNTracks.collectAsState(initial = 2)
     val savedSpotifyId by settings.spotifyClientId.collectAsState(initial = "")
     val savedGeminiKey by settings.geminiApiKey.collectAsState(initial = "")
 
@@ -90,6 +91,19 @@ fun SettingsScreen(
                 selected = themeMode,
                 onSelect = { scope.launch { settings.saveThemeMode(it) } },
                 label = { it.name.lowercase().replaceFirstChar { c -> c.uppercase() } }
+            )
+
+            HorizontalDivider()
+            SectionHeader(
+                "How often the DJ speaks",
+                "Every Nth track. Each segment costs a Gemini call, so raising this is the most " +
+                    "effective fix if you're hitting rate limits (429)."
+            )
+            SingleChoiceChipGrid(
+                options = listOf(1, 2, 3, 4, 5),
+                selected = djEveryN,
+                onSelect = { scope.launch { settings.saveDjEveryNTracks(it) } },
+                label = { if (it == 1) "Every track" else "Every $it tracks" }
             )
 
             HorizontalDivider()

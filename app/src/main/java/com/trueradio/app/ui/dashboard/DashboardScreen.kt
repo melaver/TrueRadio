@@ -1,26 +1,29 @@
 package com.trueradio.app.ui.dashboard
 
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.ThumbDown
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -32,14 +35,16 @@ import com.trueradio.app.DaySegment
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
 import com.trueradio.app.service.RadioServiceState
+import com.trueradio.app.ui.theme.RadioPalette
 import kotlinx.coroutines.launch
 
 /**
- * Radio-styled dashboard: a "tuning display" panel up top, a swipeable genre dial in the middle,
- * and a heavy mechanical power button below.
+ * Dashboard styled as a 1970s silver-face receiver faceplate: brushed champagne panel, a blue
+ * backlit tuning window with an amber needle, and a heavy knob for power.
  *
- * All live state comes from [RadioServiceState] rather than local UI flags, so the screen stays
- * truthful across rotation and when the service is stopped from its notification.
+ * The layout is scrollable rather than weight-distributed, because on short screens a fixed
+ * faceplate would either clip the dial or squash the controls - a real faceplate can be any size,
+ * a phone screen can't.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -64,110 +69,97 @@ fun DashboardScreen(
     val geminiKey by settings.geminiApiKey.collectAsState(initial = "")
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
 
-    // The dial tunes within the genres configured for the CURRENT daypart, so it always offers
-    // choices appropriate to the time of day rather than the entire genre catalogue.
     val dialGenres = remember(segmentGenres, daySegment) {
         segmentGenres.genresFor(daySegment).ifEmpty { SegmentGenres.ALL_GENRES.take(8) }
     }
     val pagerState = rememberPagerState(pageCount = { dialGenres.size })
 
-    // Keep the dial in sync when the service switches genre on its own (hourly rotation), so the
-    // needle doesn't sit on a genre that isn't actually playing.
-    LaunchedEffect(currentGenre, dialGenres) {
-        val index = dialGenres.indexOfFirst { it.equals(currentGenre, ignoreCase = true) }
+    // Sync only on a real genre change, never while the user is turning the dial.
+    LaunchedEffect(currentGenre) {
+        val genre = currentGenre ?: return@LaunchedEffect
+        if (pagerState.isScrollInProgress) return@LaunchedEffect
+        val index = dialGenres.indexOfFirst { it.equals(genre, ignoreCase = true) }
         if (index >= 0 && index != pagerState.currentPage) pagerState.animateScrollToPage(index)
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("TrueRadio", fontWeight = FontWeight.Bold) },
-                actions = {
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
-                    }
-                }
+    Box(
+        Modifier
+            .fillMaxSize()
+            // Walnut cabinet behind the faceplate.
+            .background(
+                Brush.verticalGradient(listOf(RadioPalette.Walnut, RadioPalette.WalnutDark))
             )
-        }
-    ) { padding ->
+            .padding(horizontal = 10.dp, vertical = 14.dp)
+    ) {
         Column(
-            modifier = Modifier
+            Modifier
                 .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 20.dp),
+                .clip(RoundedCornerShape(6.dp))
+                .background(RadioPalette.brushedMetal)
+                .border(1.dp, RadioPalette.ChampagneDark, RoundedCornerShape(6.dp))
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Spacer(Modifier.height(12.dp))
+            FacePlateHeader(onOpenSettings = onOpenSettings)
+            Spacer(Modifier.height(14.dp))
 
-            TuningDisplay(
+            DialWindow(
                 daySegment = daySegment,
                 genre = currentGenre,
                 nowPlaying = nowPlaying,
                 status = status,
-                isRunning = isRunning
+                isRunning = isRunning,
+                tunedIndex = pagerState.currentPage,
+                totalGenres = dialGenres.size
             )
 
-            Spacer(Modifier.height(24.dp))
-            Text(
-                "TUNE",
-                style = MaterialTheme.typography.labelMedium,
-                letterSpacing = 4.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(18.dp))
+            EngravedLabel("TUNING")
+            Spacer(Modifier.height(6.dp))
             GenreDial(genres = dialGenres, pagerState = pagerState)
 
-            Spacer(Modifier.weight(1f))
-
-            PowerButton(
-                isRunning = isRunning,
-                enabled = spotifyClientId.isNotBlank(),
-                onToggle = {
-                    if (isRunning) {
-                        onStopRadio()
-                    } else {
-                        // Persist the tuned genre as the daypart's lead choice so the service
-                        // builds this hour's mix around what the user actually dialled in.
-                        scope.launch {
-                            val tuned = dialGenres.getOrNull(pagerState.currentPage)
-                            if (tuned != null) {
-                                val reordered = listOf(tuned) + dialGenres.filterNot { it == tuned }
-                                settings.saveSegmentGenres(
-                                    segmentGenres.copy(
-                                        bySegment = segmentGenres.bySegment + (daySegment to reordered)
-                                    )
-                                )
+            Spacer(Modifier.height(22.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.Bottom
+            ) {
+                if (isRunning && nowPlaying != null) {
+                    SmallKnobButton(icon = { Icon(Icons.Default.ThumbUp, null, tint = RadioPalette.Champagne) }, label = "LIKE", onClick = onLike)
+                }
+                PowerKnob(
+                    isRunning = isRunning,
+                    enabled = spotifyClientId.isNotBlank(),
+                    onToggle = {
+                        if (isRunning) {
+                            onStopRadio()
+                        } else {
+                            scope.launch {
+                                dialGenres.getOrNull(pagerState.currentPage)?.let {
+                                    settings.saveTunedGenreOverride(it)
+                                }
+                                onStartRadio(spotifyClientId)
                             }
-                            onStartRadio(spotifyClientId)
                         }
                     }
-                }
-            )
-
-            Spacer(Modifier.height(16.dp))
-
-            if (isRunning && nowPlaying != null) {
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    FilledTonalButton(onClick = onLike) {
-                        Icon(Icons.Default.ThumbUp, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Like")
-                    }
-                    FilledTonalButton(onClick = onDislike) {
-                        Icon(Icons.Default.ThumbDown, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Skip")
-                    }
-                    FilledTonalButton(onClick = onRemix) {
-                        Icon(Icons.Default.Refresh, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("Remix")
-                    }
+                )
+                if (isRunning && nowPlaying != null) {
+                    SmallKnobButton(icon = { Icon(Icons.Default.ThumbDown, null, tint = RadioPalette.Champagne) }, label = "SKIP", onClick = onDislike)
                 }
             }
 
+            if (isRunning && nowPlaying != null) {
+                Spacer(Modifier.height(16.dp))
+                SmallKnobButton(
+                    icon = { Icon(Icons.Default.Refresh, null, tint = RadioPalette.Champagne) },
+                    label = "REMIX",
+                    onClick = onRemix
+                )
+            }
+
             if (spotifyClientId.isBlank() || geminiKey.isBlank()) {
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(16.dp))
                 AssistChip(
                     onClick = onOpenSettings,
                     label = {
@@ -178,182 +170,300 @@ fun DashboardScreen(
                     }
                 )
             }
-
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(12.dp))
         }
     }
 }
 
-/** The amber "readout" panel, styled after a radio's backlit display. */
+/** Brand strip along the top of the faceplate, with the settings control at the right. */
 @Composable
-private fun TuningDisplay(
+private fun FacePlateHeader(onOpenSettings: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column {
+            Text(
+                "TRUERADIO",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Light,
+                letterSpacing = 6.sp,
+                color = RadioPalette.KnobBlack
+            )
+            Text(
+                "STEREO AI RECEIVER",
+                style = MaterialTheme.typography.labelSmall,
+                letterSpacing = 2.sp,
+                color = Color(0xFF5A554B)
+            )
+        }
+        IconButton(onClick = onOpenSettings) {
+            Icon(Icons.Default.Settings, contentDescription = "Settings", tint = RadioPalette.KnobBlack)
+        }
+    }
+}
+
+/** Small engraved-looking caption, as printed on a metal faceplate. */
+@Composable
+private fun EngravedLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelSmall,
+        letterSpacing = 4.sp,
+        color = Color(0xFF5A554B)
+    )
+}
+
+/**
+ * The blue backlit tuning window: horizontal frequency scale, amber needle, and the readout.
+ * The needle position tracks the dial rather than being decorative, so the window and the dial
+ * always agree about where you're tuned.
+ */
+@Composable
+private fun DialWindow(
     daySegment: DaySegment,
     genre: String?,
     nowPlaying: String?,
     status: String,
-    isRunning: Boolean
+    isRunning: Boolean,
+    tunedIndex: Int,
+    totalGenres: Int
 ) {
     val greeting = when (daySegment) {
-        DaySegment.MORNING -> "Good Morning"
-        DaySegment.AFTERNOON -> "Good Afternoon"
-        DaySegment.EVENING -> "Good Evening"
-        DaySegment.NIGHT -> "Late Night"
+        DaySegment.MORNING -> "MORNING"
+        DaySegment.AFTERNOON -> "AFTERNOON"
+        DaySegment.EVENING -> "EVENING"
+        DaySegment.NIGHT -> "LATE NIGHT"
     }
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier
-            .fillMaxWidth()
-            .border(2.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp))
-    ) {
-        Column(Modifier.padding(16.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    greeting,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-                // "ON AIR" indicator, the one unmistakable signal of whether the radio is live.
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = if (isRunning) Color(0xFFD32F2F) else MaterialTheme.colorScheme.outline
-                ) {
-                    Text(
-                        if (isRunning) "ON AIR" else "OFF",
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelSmall,
-                        letterSpacing = 2.sp,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                genre?.uppercase() ?: "— — —",
-                style = MaterialTheme.typography.headlineSmall,
-                fontFamily = FontFamily.Monospace,
-                letterSpacing = 2.sp,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                nowPlaying ?: if (isRunning) "Waiting for Spotify..." else "Not playing",
-                style = MaterialTheme.typography.bodyMedium,
-                maxLines = 2
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                status,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 2
-            )
-        }
-    }
-}
+    // Needle animates between stations rather than jumping, like a real tuning pointer.
+    val needleFraction by animateFloatAsState(
+        targetValue = if (totalGenres <= 1) 0.5f else tunedIndex / (totalGenres - 1f),
+        label = "needle"
+    )
 
-/**
- * Swipeable genre dial. Uses HorizontalPager for built-in snapping, so each swipe lands cleanly
- * on one genre the way a detented tuning knob would, rather than free-scrolling between them.
- */
-@Composable
-private fun GenreDial(
-    genres: List<String>,
-    pagerState: androidx.compose.foundation.pager.PagerState
-) {
-    Box(contentAlignment = Alignment.Center) {
-        HorizontalPager(
-            state = pagerState,
-            // Side padding reveals the neighbouring genres, which is what makes it read as a dial
-            // you're scrolling through rather than a single-item carousel.
-            contentPadding = PaddingValues(horizontal = 90.dp),
-            pageSpacing = 8.dp,
-            modifier = Modifier.fillMaxWidth()
-        ) { page ->
-            val selected = page == pagerState.currentPage
-            val scale by animateFloatAsState(if (selected) 1f else 0.8f, label = "dialScale")
-            Surface(
-                shape = RoundedCornerShape(10.dp),
-                color = if (selected) MaterialTheme.colorScheme.primaryContainer
-                else MaterialTheme.colorScheme.surfaceVariant,
-                modifier = Modifier
-                    .scale(scale)
-                    .height(64.dp)
-                    .fillMaxWidth()
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        genres[page].uppercase(),
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                        textAlign = TextAlign.Center,
-                        maxLines = 2,
-                        modifier = Modifier.padding(horizontal = 6.dp)
-                    )
-                }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(4.dp))
+            .background(RadioPalette.dialWindow)
+            .border(2.dp, RadioPalette.ChampagneDark, RoundedCornerShape(4.dp))
+            .padding(14.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                greeting,
+                style = MaterialTheme.typography.labelMedium,
+                letterSpacing = 3.sp,
+                color = RadioPalette.DialGlow
+            )
+            // Pilot lamp: amber when live, dark when off.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .background(
+                            if (isRunning) RadioPalette.AmberBright else Color(0xFF2A3F52),
+                            CircleShape
+                        )
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (isRunning) "ON AIR" else "STANDBY",
+                    style = MaterialTheme.typography.labelSmall,
+                    letterSpacing = 2.sp,
+                    color = if (isRunning) RadioPalette.AmberBright else Color(0xFF5E7A88)
+                )
             }
         }
-        // Fixed centre needle marking the tuned position.
-        Box(
+
+        Spacer(Modifier.height(10.dp))
+
+        // Frequency scale with tick marks and the amber needle.
+        Canvas(
             Modifier
-                .height(80.dp)
-                .width(2.dp)
-                .background(MaterialTheme.colorScheme.primary)
+                .fillMaxWidth()
+                .height(34.dp)
+        ) {
+            val w = size.width
+            val h = size.height
+            val ticks = 40
+            repeat(ticks + 1) { i ->
+                val x = w * i / ticks
+                val major = i % 5 == 0
+                drawLine(
+                    color = if (major) RadioPalette.DialGlow else RadioPalette.DialGlow.copy(alpha = 0.4f),
+                    start = Offset(x, 0f),
+                    end = Offset(x, if (major) h * 0.45f else h * 0.25f),
+                    strokeWidth = if (major) 2f else 1f
+                )
+            }
+            val needleX = w * needleFraction
+            drawLine(
+                color = RadioPalette.AmberBright,
+                start = Offset(needleX, 0f),
+                end = Offset(needleX, h),
+                strokeWidth = 4f
+            )
+        }
+
+        Spacer(Modifier.height(6.dp))
+        Text(
+            genre?.uppercase() ?: "— — —",
+            style = MaterialTheme.typography.headlineSmall,
+            fontFamily = FontFamily.Monospace,
+            letterSpacing = 3.sp,
+            color = RadioPalette.AmberBright
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            nowPlaying ?: if (isRunning) "TUNING..." else "NO SIGNAL",
+            style = MaterialTheme.typography.bodyMedium,
+            color = RadioPalette.ChampagneLight,
+            maxLines = 2
+        )
+        Text(
+            status,
+            style = MaterialTheme.typography.bodySmall,
+            color = RadioPalette.DialGlow,
+            maxLines = 2
         )
     }
 }
 
-/** Heavy mechanical power button; presses in and lights up when live. */
-@OptIn(ExperimentalMaterial3Api::class)
+/** Swipeable genre selector; snapping gives it the detented feel of a real tuning control. */
 @Composable
-private fun PowerButton(isRunning: Boolean, enabled: Boolean, onToggle: () -> Unit) {
-    // Depth drops when active, so the control reads as physically pressed in rather than just
-    // recoloured.
-    val elevation by animateFloatAsState(if (isRunning) 2f else 12f, label = "buttonDepth")
-    Surface(
-        onClick = onToggle,
-        enabled = enabled,
-        shape = CircleShape,
-        color = Color.Transparent,
-        modifier = Modifier
-            .size(150.dp)
-            .shadow(elevation.dp, CircleShape)
-    ) {
-        Box(
-            contentAlignment = Alignment.Center,
-            modifier = Modifier.background(
-                brush = if (isRunning) {
-                    Brush.radialGradient(
-                        listOf(MaterialTheme.colorScheme.error, MaterialTheme.colorScheme.errorContainer)
+private fun GenreDial(genres: List<String>, pagerState: PagerState) {
+    Box(contentAlignment = Alignment.Center) {
+        HorizontalPager(
+            state = pagerState,
+            contentPadding = PaddingValues(horizontal = 88.dp),
+            pageSpacing = 6.dp,
+            modifier = Modifier.fillMaxWidth()
+        ) { page ->
+            val selected = page == pagerState.currentPage
+            Box(
+                Modifier
+                    .height(52.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(
+                        if (selected) RadioPalette.DialBlue else RadioPalette.ChampagneDark.copy(alpha = 0.5f)
                     )
-                } else {
-                    Brush.radialGradient(
-                        listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.primaryContainer)
-                    )
-                },
-                shape = CircleShape
-            )
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    if (isRunning) Icons.Default.Stop else Icons.Default.PlayArrow,
-                    contentDescription = null,
-                    tint = Color.White,
-                    modifier = Modifier.size(44.dp)
-                )
-                Spacer(Modifier.height(4.dp))
+                    .border(
+                        1.dp,
+                        if (selected) RadioPalette.AmberBright else RadioPalette.KnobRim,
+                        RoundedCornerShape(3.dp)
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
                 Text(
-                    if (isRunning) "STOP" else "START",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 3.sp,
-                    style = MaterialTheme.typography.labelLarge
+                    genres[page].uppercase(),
+                    style = MaterialTheme.typography.labelLarge,
+                    letterSpacing = 1.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (selected) RadioPalette.AmberBright else RadioPalette.KnobBlack,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    modifier = Modifier.padding(horizontal = 4.dp)
                 )
             }
         }
+    }
+}
+
+/** Large machined power knob with a pointer indicator. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PowerKnob(isRunning: Boolean, enabled: Boolean, onToggle: () -> Unit) {
+    val rotation by animateFloatAsState(if (isRunning) 30f else -30f, label = "knobRotation")
+    val depth by animateFloatAsState(if (isRunning) 3f else 10f, label = "knobDepth")
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(contentAlignment = Alignment.Center) {
+            Surface(
+                onClick = onToggle,
+                enabled = enabled,
+                shape = CircleShape,
+                color = Color.Transparent,
+                modifier = Modifier
+                    .size(128.dp)
+                    .shadow(depth.dp, CircleShape)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .background(
+                            Brush.radialGradient(
+                                0.0f to Color(0xFF3A3733),
+                                0.75f to RadioPalette.KnobBlack,
+                                1.0f to Color(0xFF0E0D0C)
+                            ),
+                            CircleShape
+                        )
+                        .border(3.dp, RadioPalette.KnobRim, CircleShape)
+                ) {
+                    // Pointer line, rotating between the two detent positions.
+                    Canvas(Modifier.size(112.dp)) {
+                        val cx = size.width / 2
+                        val cy = size.height / 2
+                        val rad = Math.toRadians(rotation.toDouble() - 90)
+                        val len = size.minDimension / 2 * 0.72f
+                        drawLine(
+                            color = if (isRunning) RadioPalette.AmberBright else RadioPalette.KnobRim,
+                            start = Offset(cx, cy),
+                            end = Offset(
+                                cx + (len * kotlin.math.cos(rad)).toFloat(),
+                                cy + (len * kotlin.math.sin(rad)).toFloat()
+                            ),
+                            strokeWidth = 5f
+                        )
+                    }
+                    Text(
+                        if (isRunning) "ON" else "OFF",
+                        style = MaterialTheme.typography.labelMedium,
+                        letterSpacing = 3.sp,
+                        color = if (isRunning) RadioPalette.AmberBright else RadioPalette.Champagne,
+                        modifier = Modifier.offset(y = 26.dp)
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        EngravedLabel("POWER")
+    }
+}
+
+/** Smaller secondary control styled to match the main knob. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SmallKnobButton(icon: @Composable () -> Unit, label: String, onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Surface(
+            onClick = onClick,
+            shape = CircleShape,
+            color = Color.Transparent,
+            modifier = Modifier
+                .size(56.dp)
+                .shadow(4.dp, CircleShape)
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .background(
+                        Brush.radialGradient(
+                            listOf(Color(0xFF3A3733), RadioPalette.KnobBlack)
+                        ),
+                        CircleShape
+                    )
+                    .border(2.dp, RadioPalette.KnobRim, CircleShape)
+            ) { icon() }
+        }
+        Spacer(Modifier.height(4.dp))
+        EngravedLabel(label)
     }
 }

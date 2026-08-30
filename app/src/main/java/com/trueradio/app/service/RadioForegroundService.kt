@@ -151,6 +151,10 @@ class RadioForegroundService : LifecycleService() {
     private var preparedAudio: ByteArray? = null
     private var prefetchJob: Job? = null
 
+    /** Tracks played since the DJ last spoke, compared against the user's DJ frequency setting. */
+    private var tracksSinceDj = 0
+    private var djEveryNTracks = 2
+
     private var remixCount = 0
     /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
     private var isRemixing = false
@@ -257,6 +261,7 @@ class RadioForegroundService : LifecycleService() {
         val clientId = clientIdOverride?.takeIf { it.isNotBlank() } ?: settings.snapshotSpotifyClientId()
         val geminiKey = settings.snapshotGeminiKey()
         djLanguage = settings.snapshotDjLanguage()
+        djEveryNTracks = settings.snapshotDjEveryNTracks()
 
         if (clientId.isBlank()) {
             updateStatus("Missing Spotify client ID - open the app and enter your keys.")
@@ -326,7 +331,16 @@ class RadioForegroundService : LifecycleService() {
             Log.d(DJ_TAG, "Track changed: ${track.artist} - ${track.title} (${track.durationMs}ms), re-arming DJ")
             lastTrackUri = track.uri
             lastProcessedTrackId = null
-            prefetchTriviaFor(track)
+            tracksSinceDj++
+            // Only prepare audio for tracks the DJ will actually talk after - each segment costs
+            // a Gemini TTS call, and this is the biggest single lever on quota usage.
+            if (tracksSinceDj >= djEveryNTracks) {
+                prefetchTriviaFor(track)
+            } else {
+                Log.d(DJ_TAG, "Skipping DJ for this track ($tracksSinceDj/$djEveryNTracks)")
+                preparedAudio = null
+                preparedTrackUri = null
+            }
         }
 
         updateNotification("${track.artist} - ${track.title}", track.isPaused)
@@ -430,6 +444,10 @@ class RadioForegroundService : LifecycleService() {
         // so several ticks fall inside it; without claiming first, a slow mutex handoff could let
         // two of them both pass the check and fire duplicate Gemini calls for one boundary.
         lastProcessedTrackId = track.uri
+
+        // Respect the DJ frequency setting - nothing was prepared for skipped tracks.
+        if (tracksSinceDj < djEveryNTracks) return
+        tracksSinceDj = 0
 
         if (!speakingMutex.tryLock()) {
             Log.d(DJ_TAG, "Step 1: boundary hit for '${track.title}' but DJ busy - skipping this one")
@@ -654,7 +672,10 @@ class RadioForegroundService : LifecycleService() {
         // changing them had no audible effect - the global rotation list won regardless. The
         // global list is now only the fallback for a daypart with nothing selected.
         val segment = DaySegment.forHour(hour)
-        val segmentGenres = settings.snapshotSegmentGenres().genresFor(segment)
+        // A genre the user tuned to on the dial wins for this build, then is cleared.
+        val tunedOverride = settings.consumeTunedGenreOverride()
+        val segmentGenres = tunedOverride?.let { listOf(it) }
+            ?: settings.snapshotSegmentGenres().genresFor(segment)
         val genre = if (segmentGenres.isNotEmpty()) {
             // Same rotation semantics as GenreRotation: sequential walks the list by hour,
             // otherwise pick a per-hour-stable but day-varying entry.
