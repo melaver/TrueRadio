@@ -185,6 +185,63 @@ data class GenreRotation(
     }
 }
 
+/**
+ * Genres selected per daypart, so the morning mix can differ from the late-night one. Stored as
+ * segment -> genre list; [GenreRotation] still drives the hour-by-hour rotation *within* whatever
+ * the active segment allows.
+ */
+data class SegmentGenres(
+    val bySegment: Map<DaySegment, List<String>> = DEFAULTS
+) {
+    fun genresFor(segment: DaySegment): List<String> =
+        bySegment[segment]?.takeIf { it.isNotEmpty() } ?: DEFAULTS[segment].orEmpty()
+
+    fun withGenre(segment: DaySegment, genre: String, selected: Boolean): SegmentGenres {
+        val current = bySegment[segment] ?: DEFAULTS[segment].orEmpty()
+        val updated = if (selected) (current + genre).distinct() else current - genre
+        return copy(bySegment = bySegment + (segment to updated))
+    }
+
+    /** Serialized as "SEGMENT:g1,g2|SEGMENT:g1,g2" - see NewsSource for why delimiters are stripped. */
+    fun serialize(): String = bySegment.entries.joinToString("|") { (seg, genres) ->
+        seg.name + ":" + genres.joinToString(",") { it.replace(",", " ").replace("|", " ").trim() }
+    }
+
+    companion object {
+        val ALL_GENRES = listOf(
+            "pop", "rock", "hip hop", "r&b", "electronic", "house", "techno", "indie",
+            "alternative", "jazz", "soul", "funk", "classical", "metal", "punk", "reggae",
+            "latin", "reggaeton", "country", "folk", "lo-fi", "ambient", "disco", "blues",
+            "mizrahi", "israeli rock", "mediterranean"
+        )
+
+        val DEFAULTS: Map<DaySegment, List<String>> = mapOf(
+            DaySegment.MORNING to listOf("pop", "indie", "soul"),
+            DaySegment.AFTERNOON to listOf("pop", "hip hop", "r&b"),
+            DaySegment.EVENING to listOf("rock", "alternative", "electronic"),
+            DaySegment.NIGHT to listOf("lo-fi", "ambient", "jazz")
+        )
+
+        fun deserialize(blob: String): SegmentGenres {
+            if (blob.isBlank()) return SegmentGenres()
+            val parsed = blob.split("|").mapNotNull { entry ->
+                val parts = entry.split(":")
+                if (parts.size != 2) return@mapNotNull null
+                val segment = DaySegment.entries.firstOrNull { it.name == parts[0] } ?: return@mapNotNull null
+                val genres = parts[1].split(",").map { it.trim() }.filter { it.isNotBlank() }
+                segment to genres
+            }.toMap()
+            return if (parsed.isEmpty()) SegmentGenres() else SegmentGenres(DEFAULTS + parsed)
+        }
+    }
+}
+
+/** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */
+enum class DjLanguage(val displayName: String) {
+    HEBREW("עברית"),
+    ENGLISH("English")
+}
+
 /** User's preferred UI appearance. SYSTEM follows the device's light/dark setting automatically. */
 enum class ThemeMode {
     LIGHT, DARK, SYSTEM

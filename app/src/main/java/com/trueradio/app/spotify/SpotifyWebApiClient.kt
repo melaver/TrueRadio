@@ -53,10 +53,15 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
         return Request.Builder().url(url).addHeader("Authorization", "Bearer $token").build()
     }
 
-    /** Your top artists (medium_term = ~last 6 months), each with the genre tags Spotify assigns them. */
-    suspend fun getTopArtists(limit: Int = 50): Result<List<SpotifyArtist>> = withContext(Dispatchers.IO) {
+    /**
+     * Your top artists for a given window, each with the genre tags Spotify assigns them.
+     * [timeRange] is one of short_term (~4 weeks), medium_term (~6 months), long_term (years) -
+     * the mix pulls all three so it reflects both current obsessions and long-standing favourites
+     * rather than only the last few months.
+     */
+    suspend fun getTopArtists(limit: Int = 50, timeRange: String = "medium_term"): Result<List<SpotifyArtist>> = withContext(Dispatchers.IO) {
         runCatching {
-            val request = authedRequest("https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=$limit")
+            val request = authedRequest("https://api.spotify.com/v1/me/top/artists?time_range=$timeRange&limit=$limit")
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw IOException("Get top artists failed: ${response.code}")
                 parseArtists(JSONObject(response.body?.string().orEmpty()).getJSONArray("items"))
@@ -64,13 +69,39 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
         }
     }
 
-    /** Your top tracks (medium_term), used as a personalization signal and direct playback candidates. */
-    suspend fun getTopTracks(limit: Int = 50): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
+    /** Your top tracks for a given window. See [getTopArtists] for why multiple ranges are used. */
+    suspend fun getTopTracks(limit: Int = 50, timeRange: String = "medium_term"): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
         runCatching {
-            val request = authedRequest("https://api.spotify.com/v1/me/top/tracks?time_range=medium_term&limit=$limit")
+            val request = authedRequest("https://api.spotify.com/v1/me/top/tracks?time_range=$timeRange&limit=$limit")
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw IOException("Get top tracks failed: ${response.code}")
                 parseTracks(JSONObject(response.body?.string().orEmpty()).getJSONArray("items"))
+            }
+        }
+    }
+
+    /**
+     * Your saved / "Liked Songs" library. This is the strongest taste signal available: saving a
+     * track is a deliberate choice, whereas top-tracks merely reflects what you happened to play
+     * most. Requires the `user-library-read` scope - if you authorized before that scope was
+     * added, this returns 403 until you reconnect Spotify.
+     *
+     * [offset] paginates; Spotify caps this endpoint at 50 per page.
+     */
+    suspend fun getSavedTracks(limit: Int = 50, offset: Int = 0): Result<List<SpotifyTrack>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val clamped = limit.coerceIn(1, 50)
+            val request = authedRequest("https://api.spotify.com/v1/me/tracks?limit=$clamped&offset=$offset")
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Get saved tracks failed: ${response.code}")
+                // Saved-tracks items wrap each track in a { added_at, track } envelope, unlike
+                // top-tracks which returns bare track objects.
+                val items = JSONObject(response.body?.string().orEmpty()).getJSONArray("items")
+                val tracks = JSONArray()
+                for (i in 0 until items.length()) {
+                    items.optJSONObject(i)?.optJSONObject("track")?.let { tracks.put(it) }
+                }
+                parseTracks(tracks)
             }
         }
     }

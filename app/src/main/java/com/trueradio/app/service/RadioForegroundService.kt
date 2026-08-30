@@ -12,6 +12,8 @@ import com.trueradio.app.R
 import com.trueradio.app.RadioApplication
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.TrackInfo
+import android.util.Log
+import com.trueradio.app.DjLanguage
 import com.trueradio.app.ai.GeminiClient
 import com.trueradio.app.audio.AudioPlaybackManager
 import com.trueradio.app.news.NewsRepository
@@ -19,15 +21,17 @@ import com.trueradio.app.spotify.HourlyMixEngine
 import com.trueradio.app.spotify.SpotifyManager
 import com.trueradio.app.spotify.SpotifyWebApiClient
 import com.trueradio.app.spotify.SpotifyWebAuthManager
-import com.trueradio.app.tts.TtsManager
-import com.trueradio.app.tts.TtsResult
+import com.trueradio.app.tts.LocalTtsFallback
 import com.trueradio.app.ui.MainActivity
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.Calendar
@@ -39,7 +43,7 @@ import java.util.Calendar
  *  3. Watches track position for the ~15-second-remaining trivia trigger.
  *  4. Watches the clock for the top-of-the-hour genre switch and (if Spotify Web API is
  *     connected) rebuilds and plays a personalized, genre-targeted mix via [HourlyMixEngine].
- *  5. Calls Gemini for a script, ElevenLabs (with local TTS fallback) for audio, and plays
+ *  5. Calls Gemini for a script, Gemini native TTS (with on-device fallback) for audio, and plays
  *     it back through AudioPlaybackManager with ducking.
  *  6. Publishes a persistent notification with status + Play/Pause controls.
  */
@@ -52,14 +56,24 @@ class RadioForegroundService : LifecycleService() {
         const val EXTRA_SPOTIFY_CLIENT_ID = "extra_spotify_client_id"
         private const val NOTIFICATION_ID = 42
         private const val TRIVIA_TRIGGER_WINDOW_MS = 15_000L
-        private const val NEWS_WINDOW_MINUTE_CUTOFF = 3 // top-of-hour window: minute 0..3
+        /**
+         * News now fires after this much accumulated *playback* time rather than at the top of
+         * the hour. Playback time (not wall-clock) means pausing for an hour doesn't leave a
+         * news flash queued to fire the instant you resume.
+         */
+        private const val NEWS_INTERVAL_PLAYBACK_MS = 20 * 60 * 1000L // 20 minutes of music
+        private const val PLAYBACK_TICK_MS = 10_000L
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
+        private const val TAG = "RadioDJService"
+        private const val SPEECH_TIMEOUT_MS = 45_000L
+        private const val PLAYBACK_TIMEOUT_MS = 90_000L
     }
 
     private lateinit var settings: SecureSettings
     private var spotifyManager: SpotifyManager? = null
     private var geminiClient: GeminiClient? = null
-    private var ttsManager: TtsManager? = null
+    private var localTts: LocalTtsFallback? = null
+    private var djLanguage: DjLanguage = DjLanguage.HEBREW
     private lateinit var newsRepository: NewsRepository
     private lateinit var audioPlaybackManager: AudioPlaybackManager
     private var spotifyWebAuthManager: SpotifyWebAuthManager? = null
@@ -67,7 +81,8 @@ class RadioForegroundService : LifecycleService() {
 
     private var lastTrackUri: String? = null
     private var hasFiredTriviaForCurrentTrack = false
-    private var lastNewsFlashHour = -1
+    // Accumulated milliseconds of actual playback since the last news flash.
+    private var playbackMsSinceNews = 0L
     private var lastGenreSwitchHour = -1
 
     // Guards the DJ's "one voice at a time" invariant. This used to be a plain `isSpeaking`
@@ -102,6 +117,7 @@ class RadioForegroundService : LifecycleService() {
         settings = SecureSettings(applicationContext)
         newsRepository = NewsRepository()
         audioPlaybackManager = AudioPlaybackManager(applicationContext)
+        RadioServiceState.setRunning(true)
         startForeground(NOTIFICATION_ID, buildNotification(lastKnownTrackLabel, _status.value, isPaused = false))
     }
 
@@ -127,20 +143,24 @@ class RadioForegroundService : LifecycleService() {
     private suspend fun initializeAndConnect(clientIdOverride: String?) {
         val clientId = clientIdOverride?.takeIf { it.isNotBlank() } ?: settings.snapshotSpotifyClientId()
         val geminiKey = settings.snapshotGeminiKey()
-        val elevenLabsKey = settings.snapshotElevenLabsKey()
-        val elevenLabsVoiceId = settings.snapshotElevenLabsVoiceId()
+        djLanguage = settings.snapshotDjLanguage()
 
         if (clientId.isBlank()) {
             updateStatus("Missing Spotify client ID - open the app and enter your keys.")
             return
         }
 
-        geminiClient = GeminiClient(geminiKey)
-        ttsManager = TtsManager(applicationContext, elevenLabsKey, elevenLabsVoiceId)
+        if (geminiKey.isBlank()) {
+            Log.e(TAG, "Gemini API key is blank - DJ speech will be unavailable")
+            updateStatus("Missing Gemini API key - the DJ can't speak. Add it in Settings.")
+        }
+        geminiClient = GeminiClient(geminiKey, djLanguage)
+        localTts = LocalTtsFallback(applicationContext)
+        Log.d(TAG, "Initialized DJ (language=$djLanguage, geminiKeyPresent=${geminiKey.isNotBlank()})")
 
         val webAuth = SpotifyWebAuthManager(applicationContext, settings, clientId)
         spotifyWebAuthManager = webAuth
-        hourlyMixEngine = HourlyMixEngine(SpotifyWebApiClient(webAuth), settings)
+        hourlyMixEngine = HourlyMixEngine(SpotifyWebApiClient(webAuth), settings, geminiClient)
 
         val manager = SpotifyManager(applicationContext, clientId)
         spotifyManager = manager
@@ -148,6 +168,7 @@ class RadioForegroundService : LifecycleService() {
             if (success) {
                 updateStatus("Connected to Spotify")
                 observePlayback(manager)
+                startPlaybackTicker()
                 lifecycleScope.launch { startInitialPlayback(manager) }
             } else {
                 updateStatus("Spotify connection failed: ${error?.message}")
@@ -183,21 +204,38 @@ class RadioForegroundService : LifecycleService() {
 
         if (speakingMutex.isLocked || track.isPaused) return
 
-        maybeTriggerHourlyNews()
         maybeTriggerGenreSwitch()
         maybeTriggerTrackTrivia(track)
     }
 
-    /** Top-of-hour news flash: fires once per hour, inside the first few minutes of that hour. */
-    private fun maybeTriggerHourlyNews() {
-        val calendar = Calendar.getInstance()
-        val hour = calendar.get(Calendar.HOUR_OF_DAY)
-        val minute = calendar.get(Calendar.MINUTE)
-        if (minute > NEWS_WINDOW_MINUTE_CUTOFF) return
-        if (hour == lastNewsFlashHour) return
-        if (!speakingMutex.tryLock()) return // something else is already speaking; retry on the next player-state tick
+    /**
+     * Drives time-based triggers from a steady ticker rather than from PlayerState callbacks.
+     *
+     * App Remote emits PlayerState on *changes* (play/pause/seek/track change), not on a clock,
+     * so accumulating elapsed time from those events alone would undercount badly during a long
+     * track - a 4-minute song might produce almost no events. The ticker gives a reliable time
+     * base independent of how chatty the SDK happens to be.
+     */
+    private fun startPlaybackTicker() {
+        lifecycleScope.launch {
+            while (isActive) {
+                delay(PLAYBACK_TICK_MS)
+                if (lastKnownIsPaused) continue // only count time the music is actually playing
+                playbackMsSinceNews += PLAYBACK_TICK_MS
+                if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
+                    maybeTriggerNewsFlash()
+                }
+            }
+        }
+    }
 
-        lastNewsFlashHour = hour
+    /** News flash: fires after NEWS_INTERVAL_PLAYBACK_MS of accumulated playback. */
+    private fun maybeTriggerNewsFlash() {
+        if (!speakingMutex.tryLock()) return // something else is speaking; retry on the next tick
+
+        // Reset before the coroutine runs so a slow fetch can't let a second flash queue up.
+        playbackMsSinceNews = 0L
+        Log.d(TAG, "News flash triggered after 20 min of playback")
         lifecycleScope.launch {
             try {
                 runNewsFlash()
@@ -218,6 +256,7 @@ class RadioForegroundService : LifecycleService() {
         if (!speakingMutex.tryLock()) return // something else is already speaking; retry on the next player-state tick
 
         lastGenreSwitchHour = hour
+        Log.d(TAG, "Genre switch triggered for hour $hour")
         lifecycleScope.launch {
             try {
                 if (spotifyWebAuthManager?.isConnected() == true) {
@@ -240,6 +279,7 @@ class RadioForegroundService : LifecycleService() {
         // stays false, but the next track resets it anyway) - a rare missed line beats overlapping speech.
 
         hasFiredTriviaForCurrentTrack = true
+        Log.d(TAG, "Trivia triggered for ${track.artist} - ${track.title} (${track.durationMs - track.positionMs}ms left)")
         lifecycleScope.launch {
             try {
                 runTrackTrivia(track)
@@ -276,7 +316,25 @@ class RadioForegroundService : LifecycleService() {
         val manager = spotifyManager ?: return
         val rotation = settings.snapshotGenreRotation()
         val daySeed = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
-        val genre = rotation.genreForHour(hour, daySeed) ?: return
+
+        // Prefer the genres the user picked for THIS daypart (Settings > "Music genres by time of
+        // day"). Those were previously stored and editable but never actually consulted here, so
+        // changing them had no audible effect - the global rotation list won regardless. The
+        // global list is now only the fallback for a daypart with nothing selected.
+        val segment = DaySegment.forHour(hour)
+        val segmentGenres = settings.snapshotSegmentGenres().genresFor(segment)
+        val genre = if (segmentGenres.isNotEmpty()) {
+            // Same rotation semantics as GenreRotation: sequential walks the list by hour,
+            // otherwise pick a per-hour-stable but day-varying entry.
+            if (rotation.sequential) {
+                segmentGenres[hour % segmentGenres.size]
+            } else {
+                segmentGenres[kotlin.random.Random(hour * 31 + daySeed).nextInt(segmentGenres.size)]
+            }
+        } else {
+            rotation.genreForHour(hour, daySeed)
+        } ?: return
+        Log.d(TAG, "Hour $hour -> segment $segment -> genre '$genre'")
 
         updateStatus("Building $genre mix for this hour...")
         val playlistUriResult = engine.buildAndPublishMixForGenre(genre)
@@ -310,27 +368,44 @@ class RadioForegroundService : LifecycleService() {
         speakLine(script, label = "Trivia")
     }
 
+    /**
+     * Full DJ speech path: Gemini TTS -> ducked WAV playback, with on-device TTS as fallback.
+     *
+     * Every stage is logged and time-boxed. The hard timeout matters more than it looks: if a
+     * synthesis or playback call hangs, audio focus stays held and Spotify stays ducked
+     * indefinitely - the music would sit quiet forever with no error. Bailing out and letting
+     * music continue is always better than a stuck DJ.
+     */
     private suspend fun speakLine(script: String, label: String) {
-        val tts = ttsManager ?: return
-        val manager = spotifyManager
+        val gemini = geminiClient
+        Log.d(TAG, "[$label] speak start: \"${script.take(60)}...\"")
         updateStatus("$label: speaking...")
+
         try {
-            when (val result = tts.synthesize(script)) {
-                is TtsResult.AudioFile -> {
-                    audioPlaybackManager.playDuckedLine(result.file)
-                    result.file.delete()
-                }
-                TtsResult.SpokenLocally -> {
-                    // Local TextToSpeech already played synchronously inside TtsManager;
-                    // Spotify was not explicitly ducked in that fallback path since the
-                    // platform TTS engine requests its own transient focus internally.
-                }
+            val wav = withTimeoutOrNull(SPEECH_TIMEOUT_MS) {
+                gemini?.synthesizeSpeech(script)?.getOrNull()
             }
+
+            if (wav != null) {
+                Log.d(TAG, "[$label] Gemini TTS ok (${wav.size} bytes)")
+                val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
+                    audioPlaybackManager.playDuckedAudio(wav)
+                    true
+                }
+                if (played == null) Log.e(TAG, "[$label] playback timed out; releasing focus")
+            } else {
+                Log.w(TAG, "[$label] Gemini TTS unavailable - falling back to on-device TTS")
+                val spoke = localTts?.speak(script, djLanguage) ?: false
+                if (!spoke) Log.e(TAG, "[$label] on-device TTS also failed; skipping DJ line")
+            }
+        } catch (e: Exception) {
+            // Never let a DJ failure kill the service or leave music ducked.
+            Log.e(TAG, "[$label] speech path threw", e)
         } finally {
             updateStatus("On air")
+            Log.d(TAG, "[$label] speak finished")
+            spotifyManager?.play() // resume in case the OS paused rather than ducked
         }
-        // Resume Spotify playback in case it was paused by the OS during the ducking window.
-        manager?.play()
     }
 
     private fun togglePlayback() {
@@ -342,10 +417,12 @@ class RadioForegroundService : LifecycleService() {
 
     private fun updateStatus(message: String) {
         _status.value = message
+        RadioServiceState.setStatus(message)
         refreshNotification()
     }
 
     private fun updateNotification(trackLabel: String, isPaused: Boolean) {
+        RadioServiceState.setNowPlaying(trackLabel)
         lastKnownTrackLabel = trackLabel
         lastKnownIsPaused = isPaused
         refreshNotification()
@@ -395,7 +472,8 @@ class RadioForegroundService : LifecycleService() {
 
     override fun onDestroy() {
         spotifyManager?.disconnect()
-        ttsManager?.release()
+        RadioServiceState.setRunning(false)
+        localTts?.release()
         audioPlaybackManager.release()
         super.onDestroy()
     }

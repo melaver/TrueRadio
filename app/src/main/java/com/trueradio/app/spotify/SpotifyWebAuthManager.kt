@@ -59,6 +59,9 @@ class SpotifyWebAuthManager(
         private const val TOKEN_URL = "https://accounts.spotify.com/api/token"
         val REQUIRED_SCOPES = listOf(
             "user-top-read",
+            // Saved/"Liked Songs" - a deliberate signal (you chose to save it) rather than a
+            // merely-frequent one, so it's weighted above top-tracks in the mix.
+            "user-library-read",
             "playlist-modify-private",
             "playlist-read-private",
             "user-read-private"

@@ -22,8 +22,6 @@ class SecureSettings(private val context: Context) {
     private object Keys {
         val SPOTIFY_CLIENT_ID = stringPreferencesKey("spotify_client_id")
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
-        val ELEVENLABS_API_KEY = stringPreferencesKey("elevenlabs_api_key")
-        val ELEVENLABS_VOICE_ID = stringPreferencesKey("elevenlabs_voice_id")
         val NEWS_CATEGORIES = stringPreferencesKey("news_categories") // comma-separated NewsCategory names
         val NEWS_LIKED_TOPICS = stringPreferencesKey("news_liked_topics") // comma-separated free-text keywords
         val NEWS_SOURCES = stringPreferencesKey("news_sources") // serialized NewsSource list, see NewsSource.serializeList
@@ -34,12 +32,13 @@ class SecureSettings(private val context: Context) {
         val SPOTIFY_HOURLY_PLAYLIST_ID = stringPreferencesKey("spotify_hourly_playlist_id")
         val SPOTIFY_PKCE_CODE_VERIFIER = stringPreferencesKey("spotify_pkce_code_verifier") // transient, cleared after token exchange
         val THEME_MODE = stringPreferencesKey("theme_mode")
+        val DJ_LANGUAGE = stringPreferencesKey("dj_language")
+        val ONBOARDING_COMPLETE = stringPreferencesKey("onboarding_complete")
+        val SEGMENT_GENRES = stringPreferencesKey("segment_genres")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
     val geminiApiKey: Flow<String> = context.dataStore.data.map { it[Keys.GEMINI_API_KEY] ?: "" }
-    val elevenLabsApiKey: Flow<String> = context.dataStore.data.map { it[Keys.ELEVENLABS_API_KEY] ?: "" }
-    val elevenLabsVoiceId: Flow<String> = context.dataStore.data.map { it[Keys.ELEVENLABS_VOICE_ID] ?: "" }
 
     val newsCategoriesCsv: Flow<String> = context.dataStore.data.map { it[Keys.NEWS_CATEGORIES] ?: NewsCategory.GENERAL.name }
     val newsLikedTopicsCsv: Flow<String> = context.dataStore.data.map { it[Keys.NEWS_LIKED_TOPICS] ?: "" }
@@ -58,13 +57,18 @@ class SecureSettings(private val context: Context) {
     val themeMode: Flow<ThemeMode> = context.dataStore.data.map { prefs ->
         ThemeMode.entries.firstOrNull { it.name == prefs[Keys.THEME_MODE] } ?: ThemeMode.SYSTEM
     }
+    val djLanguage: Flow<DjLanguage> = context.dataStore.data.map { prefs ->
+        DjLanguage.entries.firstOrNull { it.name == prefs[Keys.DJ_LANGUAGE] } ?: DjLanguage.HEBREW
+    }
+    val segmentGenres: Flow<SegmentGenres> = context.dataStore.data.map {
+        SegmentGenres.deserialize(it[Keys.SEGMENT_GENRES] ?: "")
+    }
+    val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
-    suspend fun saveAll(spotifyClientId: String, geminiKey: String, elevenLabsKey: String, elevenLabsVoiceId: String) {
+    suspend fun saveAll(spotifyClientId: String, geminiKey: String) {
         context.dataStore.edit { prefs ->
             prefs[Keys.SPOTIFY_CLIENT_ID] = spotifyClientId
             prefs[Keys.GEMINI_API_KEY] = geminiKey
-            prefs[Keys.ELEVENLABS_API_KEY] = elevenLabsKey
-            prefs[Keys.ELEVENLABS_VOICE_ID] = elevenLabsVoiceId
         }
     }
 
@@ -114,9 +118,19 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.THEME_MODE] = mode.name }
     }
 
+    suspend fun saveDjLanguage(language: DjLanguage) {
+        context.dataStore.edit { prefs -> prefs[Keys.DJ_LANGUAGE] = language.name }
+    }
+
+    suspend fun saveSegmentGenres(genres: SegmentGenres) {
+        context.dataStore.edit { prefs -> prefs[Keys.SEGMENT_GENRES] = genres.serialize() }
+    }
+
+    suspend fun setOnboardingComplete(complete: Boolean) {
+        context.dataStore.edit { prefs -> prefs[Keys.ONBOARDING_COMPLETE] = complete.toString() }
+    }
+
     suspend fun snapshotGeminiKey(): String = geminiApiKey.first()
-    suspend fun snapshotElevenLabsKey(): String = elevenLabsApiKey.first()
-    suspend fun snapshotElevenLabsVoiceId(): String = elevenLabsVoiceId.first()
     suspend fun snapshotSpotifyClientId(): String = spotifyClientId.first()
     suspend fun snapshotNewsPreferences(): NewsPreferences = newsPreferences.first()
     suspend fun snapshotGenreRotation(): GenreRotation = genreRotation.first()
@@ -125,4 +139,7 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotSpotifyWebTokenExpiresAt(): Long = spotifyWebTokenExpiresAt.first()
     suspend fun snapshotSpotifyHourlyPlaylistId(): String = spotifyHourlyPlaylistId.first()
     suspend fun snapshotThemeMode(): ThemeMode = themeMode.first()
+    suspend fun snapshotDjLanguage(): DjLanguage = djLanguage.first()
+    suspend fun snapshotOnboardingComplete(): Boolean = onboardingComplete.first()
+    suspend fun snapshotSegmentGenres(): SegmentGenres = segmentGenres.first()
 }

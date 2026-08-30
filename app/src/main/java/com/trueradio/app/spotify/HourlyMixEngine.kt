@@ -1,6 +1,8 @@
 package com.trueradio.app.spotify
 
+import android.util.Log
 import com.trueradio.app.SecureSettings
+import com.trueradio.app.ai.GeminiClient
 
 /**
  * Builds the track list for "this hour's genre" out of the user's own Spotify taste data, then
@@ -27,107 +29,167 @@ import com.trueradio.app.SecureSettings
  */
 class HourlyMixEngine(
     private val webApi: SpotifyWebApiClient,
-    private val settings: SecureSettings
+    private val settings: SecureSettings,
+    /**
+     * Optional: used only to suggest similar artists. Null disables the discovery tier and the
+     * mix falls back to genre search for unfamiliar material - see [suggestedArtistTracks].
+     */
+    private val geminiClient: GeminiClient? = null
 ) {
     companion object {
+        private const val TAG = "HourlyMixEngine"
         private const val PLAYLIST_NAME = "TrueRadio Hourly Mix"
         private const val PLAYLIST_DESCRIPTION = "Auto-updated every hour by TrueRadio - do not add manual tracks, they'll be replaced."
         private const val TARGET_TRACK_COUNT = 30
         private const val SEARCH_PAGE_SIZE = 10 // Spotify's Feb 2026 search `limit` cap
-        private const val MAX_TRACKS_PER_ARTIST = 10 // cap so Tier 2 doesn't exhaust the mix on one artist
+
+        // Target share of the mix per tier. Familiar material dominates so the hour feels like
+        // *your* station, with a deliberate slice reserved for discovery so it isn't just a
+        // rotation of things you've already heard to death.
+        private const val SHARE_SAVED = 0.35        // your Liked Songs
+        private const val SHARE_TOP = 0.30          // your most-played
+        private const val SHARE_DEEP_CUTS = 0.15    // more from artists you already love
+        private const val SHARE_DISCOVERY = 0.20    // Gemini-suggested adjacent artists
     }
 
     /**
      * Builds and publishes the mix for [genre], returning the playlist's Spotify URI to play.
-     * Reuses the same playlist across hours (creating it once) so App Remote just re-plays the
-     * same context with new contents rather than switching between many playlist objects.
+     *
+     * Curation model - five signals, strongest first. Spotify removed both `/recommendations`
+     * and `/artists/{id}/related-artists` in Nov 2024, so there is no similarity API to lean on;
+     * everything below is assembled from endpoints that still exist, plus Gemini standing in as
+     * the "who else would they like" engine.
+     *
+     *  1. SAVED    - tracks from your Liked Songs whose artist matches the genre. Deliberately
+     *                saved, so the strongest signal available.
+     *  2. TOP      - your most-played tracks across short/medium/long term, so both current
+     *                obsessions and long-standing favourites are represented.
+     *  3. DEEP CUT - other catalog tracks by artists you already listen to, so a familiar artist
+     *                can show up with a song you haven't worn out.
+     *  4. DISCOVERY- tracks by artists Gemini suggests based on your actual top artists, resolved
+     *                through Spotify search so nothing hallucinated can reach the playlist.
+     *  5. FILL     - plain genre search, only if the tiers above can't fill the hour.
+     *
+     * Tiers are shuffled internally but concatenated in order, so familiar material leads.
      */
     suspend fun buildAndPublishMixForGenre(genre: String): Result<String> {
         val playlistId = ensurePlaylistExists().getOrElse { return Result.failure(it) }
+        val genreLower = genre.lowercase()
 
-        val topArtistsResult = webApi.getTopArtists()
-        val topTracksResult = webApi.getTopTracks()
+        // Top artists across all three windows: a long_term favourite you haven't played lately
+        // is still a favourite, and short_term catches what you're into right now.
+        val allTopArtists = listOf("short_term", "medium_term", "long_term")
+            .flatMap { range -> webApi.getTopArtists(timeRange = range).getOrDefault(emptyList()) }
+            .distinctBy { it.id }
 
-        // If both basic personalization calls failed outright (as opposed to just returning
-        // empty lists), it's almost certainly an auth/network problem affecting the whole
-        // session - surface that real error rather than masking it behind a generic "no tracks
-        // found for this genre" message further down, which would send the user chasing the
-        // wrong problem (e.g. trying broader genre names when the actual issue is an expired
-        // Spotify connection).
-        if (topArtistsResult.isFailure && topTracksResult.isFailure) {
+        val allTopTracks = listOf("short_term", "medium_term", "long_term")
+            .flatMap { range -> webApi.getTopTracks(timeRange = range).getOrDefault(emptyList()) }
+            .distinctBy { it.uri }
+
+        val savedTracks = webApi.getSavedTracks().getOrDefault(emptyList())
+
+        if (allTopArtists.isEmpty() && allTopTracks.isEmpty() && savedTracks.isEmpty()) {
+            // Everything personal came back empty - almost always an auth problem (or a brand-new
+            // account with no history). Surface it rather than silently shipping a generic mix.
+            Log.e(TAG, "No personal listening data available at all")
             return Result.failure(
-                topArtistsResult.exceptionOrNull() ?: topTracksResult.exceptionOrNull()
-                ?: IllegalStateException("Failed to read Spotify listening history")
+                IllegalStateException("Couldn't read your Spotify listening history - try reconnecting Spotify in Settings")
             )
         }
 
-        val topArtists = topArtistsResult.getOrDefault(emptyList())
-        val topTracks = topTracksResult.getOrDefault(emptyList())
+        // Genre matching is via artist tags: Spotify tags artists, not tracks, and removed the
+        // per-track `popularity` field, so an artist's tags are the only genre signal left.
+        val genreArtists = allTopArtists.filter { a -> a.genres.any { it.lowercase().contains(genreLower) } }
+        val genreArtistNames = genreArtists.map { it.name }.toSet()
+        fun matchesGenre(track: SpotifyTrack) =
+            genreArtistNames.any { it.equals(track.artistName, ignoreCase = true) }
 
-        val genreLower = genre.lowercase()
-        val matchingTopArtists = topArtists.filter { artist ->
-            artist.genres.any { it.lowercase().contains(genreLower) }
+        val quota = { share: Double -> (TARGET_TRACK_COUNT * share).toInt().coerceAtLeast(1) }
+
+        // --- Tier 1: saved tracks in this genre
+        val savedTier = savedTracks.filter(::matchesGenre).map { it.uri }.shuffled().take(quota(SHARE_SAVED))
+        Log.d(TAG, "Tier SAVED: ${savedTier.size}")
+
+        // --- Tier 2: most-played tracks in this genre
+        val topTier = allTopTracks.filter(::matchesGenre).map { it.uri }
+            .filterNot { it in savedTier }.shuffled().take(quota(SHARE_TOP))
+        Log.d(TAG, "Tier TOP: ${topTier.size}")
+
+        // --- Tier 3: deeper catalog from artists already established as favourites
+        val deepTier = mutableListOf<String>()
+        for (artist in genreArtists.shuffled()) {
+            if (deepTier.size >= quota(SHARE_DEEP_CUTS)) break
+            deepTier += webApi.searchTracksByArtist(artist.name, limit = 5)
+                .getOrDefault(emptyList()).map { it.uri }
         }
-        val matchingTopArtistIds = matchingTopArtists.map { it.id }.toSet()
+        Log.d(TAG, "Tier DEEP: ${deepTier.size}")
 
-        // Tier 1: the user's own top tracks whose (top-track) artist is in the genre-matching set.
-        // We don't have per-track genre tags directly, so we approximate via the track's artist name
-        // matching a genre-tagged top artist - imperfect but keeps this within available endpoints.
-        val personalizedTracks = topTracks.filter { track ->
-            topArtists.any { it.id in matchingTopArtistIds && it.name.equals(track.artistName, ignoreCase = true) }
-        }
+        // --- Tier 4: discovery via Gemini-suggested adjacent artists
+        val discoveryTier = suggestedArtistTracks(
+            seeds = genreArtists.map { it.name }.ifEmpty { allTopArtists.map { it.name } },
+            genre = genre,
+            limit = quota(SHARE_DISCOVERY)
+        )
+        Log.d(TAG, "Tier DISCOVERY: ${discoveryTier.size}")
 
-        val allUris = personalizedTracks.map { it.uri }.shuffled().toMutableList()
+        val curated = (savedTier + topTier + deepTier.shuffled() + discoveryTier).distinct().toMutableList()
 
-        // Tier 2: more tracks from those SAME already-known artists, via direct catalog search -
-        // see the class doc comment for why this (not genre-wide search) is the main lever for
-        // "more known songs" now that popularity scores aren't available to sort by.
-        if (allUris.size < TARGET_TRACK_COUNT && matchingTopArtists.isNotEmpty()) {
-            val knownArtistUris = mutableListOf<String>()
-            for (artist in matchingTopArtists.shuffled()) {
-                if (allUris.size + knownArtistUris.size >= TARGET_TRACK_COUNT) break
-                val artistTracks = webApi.searchTracksByArtist(artist.name, limit = MAX_TRACKS_PER_ARTIST)
-                    .getOrDefault(emptyList())
-                knownArtistUris += artistTracks.map { it.uri }
-            }
-            allUris += knownArtistUris.shuffled()
-        }
-
-        // Tier 3, last resort: genre-wide search across any artist, paginated via offset since
-        // each call returns at most SEARCH_PAGE_SIZE results. Only reached if the user doesn't
-        // yet have enough of their own genre-matching listening history for tiers 1-2 to fill
-        // the mix (e.g. a genre they're just getting into).
-        if (allUris.size < TARGET_TRACK_COUNT) {
-            val discoveredUris = mutableListOf<String>()
+        // --- Tier 5: genre-search fill, only if the personal tiers came up short
+        if (curated.size < TARGET_TRACK_COUNT) {
             var offset = 0
-            while (allUris.size + discoveredUris.size < TARGET_TRACK_COUNT) {
+            while (curated.size < TARGET_TRACK_COUNT) {
                 val page = webApi.searchTracksByGenre(genre, limit = SEARCH_PAGE_SIZE, offset = offset)
                     .getOrDefault(emptyList())
-                if (page.isEmpty()) break // no more results available for this genre
-                discoveredUris += page.map { it.uri }
+                if (page.isEmpty()) break
+                curated += page.map { it.uri }.filterNot { it in curated }
                 offset += page.size
             }
-            allUris += discoveredUris.shuffled()
+            Log.d(TAG, "After genre fill: ${curated.size}")
         }
 
-        val finalUris = allUris.distinct().take(TARGET_TRACK_COUNT)
+        val finalUris = curated.distinct().take(TARGET_TRACK_COUNT)
         if (finalUris.isEmpty()) {
             return Result.failure(IllegalStateException("Could not find any tracks for genre '$genre' - try a broader genre name"))
         }
+        Log.d(TAG, "Publishing ${finalUris.size} tracks for genre '$genre'")
 
         val replaceResult = webApi.replacePlaylistTracks(playlistId, finalUris)
         if (replaceResult.isFailure) {
-            // The cached playlist may have been deleted or unfollowed by the user outside the
-            // app - without this fallback, every future hourly switch would fail forever against
-            // a dead playlist ID with no way to recover short of clearing app data. Drop the
-            // cached id and create a fresh playlist once before giving up.
+            // The cached playlist may have been deleted or unfollowed outside the app; without
+            // this, every future hourly switch would fail forever against a dead playlist id.
             settings.saveSpotifyHourlyPlaylistId("")
             val newPlaylistId = ensurePlaylistExists().getOrElse { return Result.failure(it) }
             webApi.replacePlaylistTracks(newPlaylistId, finalUris).getOrElse { return Result.failure(it) }
             return Result.success("spotify:playlist:$newPlaylistId")
         }
-
         return Result.success("spotify:playlist:$playlistId")
+    }
+
+    /**
+     * Asks Gemini which artists this listener would likely enjoy, then resolves each name to real
+     * tracks via Spotify search. The search step is what makes this safe: a suggestion that
+     * doesn't correspond to a real artist simply returns nothing and is skipped, so a
+     * hallucinated name can never end up in the playlist.
+     */
+    private suspend fun suggestedArtistTracks(seeds: List<String>, genre: String, limit: Int): List<String> {
+        val gemini = geminiClient ?: return emptyList()
+        if (seeds.isEmpty()) return emptyList()
+
+        val suggestions = gemini.suggestSimilarArtists(seeds, genre).getOrElse {
+            Log.w(TAG, "Artist suggestion failed; skipping discovery tier", it)
+            return emptyList()
+        }
+        if (suggestions.isEmpty()) return emptyList()
+        Log.d(TAG, "Gemini suggested: ${suggestions.joinToString(", ")}")
+
+        val uris = mutableListOf<String>()
+        for (name in suggestions) {
+            if (uris.size >= limit) break
+            // 2 tracks per suggested artist keeps discovery varied across several new artists
+            // rather than dropping a block of one unfamiliar act into the hour.
+            uris += webApi.searchTracksByArtist(name, limit = 2).getOrDefault(emptyList()).map { it.uri }
+        }
+        return uris.take(limit)
     }
 
     private suspend fun ensurePlaylistExists(): Result<String> {

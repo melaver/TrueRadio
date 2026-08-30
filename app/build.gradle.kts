@@ -81,12 +81,14 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
+    implementation("androidx.compose.material:material-icons-extended")
     // Explicit rather than relying on it coming transitively via activity-compose: this is the
     // first time this codebase's Kotlin has ever actually reached the compiler (both prior CI
     // failures were earlier in the pipeline - Gradle config, then resource linking) - safer to
     // declare it directly than assume a transitive dependency for the rememberSaveable() used
     // in MainActivity.kt.
     implementation("androidx.compose.runtime:runtime-saveable")
+    implementation("androidx.navigation:navigation-compose:2.8.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     // Coroutines

@@ -34,6 +34,24 @@ class AudioPlaybackManager(private val context: Context) {
             .build()
     }
 
+    /**
+     * Writes Gemini's WAV bytes to a temp cache file and plays them ducked, cleaning up after.
+     * Wrapped in a timeout by the caller; the temp file is always deleted even on failure so the
+     * cache can't grow unbounded across a long-running session.
+     */
+    suspend fun playDuckedAudio(wavBytes: ByteArray) {
+        val file = File(context.cacheDir, "dj_line_${System.currentTimeMillis()}.wav")
+        try {
+            file.writeBytes(wavBytes)
+            android.util.Log.d("AudioPlaybackManager", "Playing ${wavBytes.size} bytes of DJ audio")
+            playDuckedLine(file)
+        } finally {
+            if (file.exists() && !file.delete()) {
+                android.util.Log.w("AudioPlaybackManager", "Could not delete temp audio ${file.name}")
+            }
+        }
+    }
+
     /** Requests ducking focus, plays the DJ line to completion, then abandons focus. */
     suspend fun playDuckedLine(file: File) = suspendCancellableCoroutine<Unit> { cont ->
         val granted = requestDuckingFocus()
