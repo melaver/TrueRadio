@@ -37,6 +37,7 @@ class SecureSettings(private val context: Context) {
         val SEGMENT_GENRES = stringPreferencesKey("segment_genres")
         val TRACK_FEEDBACK = stringPreferencesKey("track_feedback")
         val GENRE_ANCHORS = stringPreferencesKey("genre_anchors")
+        val SONG_LANGUAGE = stringPreferencesKey("song_language")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -70,6 +71,9 @@ class SecureSettings(private val context: Context) {
     }
     val genreAnchors: Flow<GenreAnchors> = context.dataStore.data.map {
         GenreAnchors.deserialize(it[Keys.GENRE_ANCHORS] ?: "")
+    }
+    val songLanguage: Flow<SongLanguage> = context.dataStore.data.map { prefs ->
+        SongLanguage.entries.firstOrNull { it.name == prefs[Keys.SONG_LANGUAGE] } ?: SongLanguage.ANY
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -142,6 +146,10 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.GENRE_ANCHORS] = anchors.serialize() }
     }
 
+    suspend fun saveSongLanguage(language: SongLanguage) {
+        context.dataStore.edit { prefs -> prefs[Keys.SONG_LANGUAGE] = language.name }
+    }
+
     suspend fun setOnboardingComplete(complete: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.ONBOARDING_COMPLETE] = complete.toString() }
     }
@@ -160,4 +168,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotSegmentGenres(): SegmentGenres = segmentGenres.first()
     suspend fun snapshotTrackFeedback(): TrackFeedback = trackFeedback.first()
     suspend fun snapshotGenreAnchors(): GenreAnchors = genreAnchors.first()
+    suspend fun snapshotSongLanguage(): SongLanguage = songLanguage.first()
 }

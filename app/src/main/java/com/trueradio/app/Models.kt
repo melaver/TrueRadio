@@ -364,6 +364,25 @@ data class GenreAnchors(
     }
 }
 
+/**
+ * Optional constraint on the language songs are sung in.
+ *
+ * NOTE: Spotify exposes no language field on tracks or artists, so this cannot be a hard filter.
+ * It works by steering artist selection (Gemini is asked for artists who perform in this
+ * language) and by tagging genre searches. Tracks coming from your own saved/top library are NOT
+ * filtered - they're already your taste, and there'd be no reliable way to detect their language
+ * anyway. Treat it as a strong bias, not a guarantee.
+ */
+enum class SongLanguage(val displayName: String, val promptName: String?) {
+    ANY("Any language", null),
+    HEBREW("עברית / Hebrew", "Hebrew"),
+    ENGLISH("English", "English"),
+    SPANISH("Español / Spanish", "Spanish"),
+    FRENCH("Français / French", "French"),
+    ARABIC("العربية / Arabic", "Arabic"),
+    RUSSIAN("Русский / Russian", "Russian")
+}
+
 /** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */
 enum class DjLanguage(val displayName: String) {
     HEBREW("עברית"),

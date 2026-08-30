@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -75,6 +76,10 @@ class RadioForegroundService : LifecycleService() {
          */
         private const val PLAYBACK_TICK_MS = 2_000L
         private const val DJ_TAG = "DJ_FLOW"
+        /** How many upcoming tracks' scripts to generate per batched request. */
+        private const val SCRIPT_BATCH_SIZE = 5
+        /** Refill the batch when fewer than this many cached scripts remain. */
+        private const val SCRIPT_REFILL_THRESHOLD = 2
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
         private const val TAG = "RadioDJService"
         /**
@@ -117,6 +122,33 @@ class RadioForegroundService : LifecycleService() {
     private var lastProcessedTrackId: String? = null
 
     /** Incremented per manual remix so each one reaches different material - see HourlyMixEngine. */
+    /**
+     * Trivia audio generated ahead of time for a specific track, played when that track reaches
+     * its boundary.
+     *
+     * Previously generation started AT the 15s boundary, which gave Gemini ~15 seconds to return
+     * both a script and audio. Any retry (429/503) blew straight past the track end and the
+     * segment was lost. Generating at track start gives the whole song's duration of headroom, so
+     * transient failures have room to recover.
+     *
+     * NOTE: this does not by itself reduce quota usage - 429 is a rate limit, not a timing
+     * problem - it just stops a slow-but-eventually-successful call from missing its window.
+     * Quota pressure is addressed separately by GeminiClient's artist-list cache.
+     */
+    /**
+     * Pre-generated trivia SCRIPTS keyed "artist|title", filled 5 at a time by one batched Gemini
+     * call. Scripts batch cheaply; audio does not (TTS returns one stream per request), so audio
+     * is still synthesized per track in [prefetchTriviaFor] using whatever script is waiting here.
+     */
+    private val scriptCache = mutableMapOf<String, String>()
+    private var batchJob: Job? = null
+    /** Keys already batched, so a refill doesn't regenerate scripts for the same tracks. */
+    private val consumedScriptKeys = mutableSetOf<String>()
+
+    private var preparedTrackUri: String? = null
+    private var preparedAudio: ByteArray? = null
+    private var prefetchJob: Job? = null
+
     private var remixCount = 0
     /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
     private var isRemixing = false
@@ -264,6 +296,7 @@ class RadioForegroundService : LifecycleService() {
             Log.d(DJ_TAG, "Track changed: ${track.artist} - ${track.title} (${track.durationMs}ms), re-arming DJ")
             lastTrackUri = track.uri
             lastProcessedTrackId = null
+            prefetchTriviaFor(track)
         }
 
         updateNotification("${track.artist} - ${track.title}", track.isPaused)
@@ -384,6 +417,90 @@ class RadioForegroundService : LifecycleService() {
     }
 
     /**
+     * Generates this track's outro audio at the START of the track, so it's ready and waiting by
+     * the time the boundary arrives. See [preparedTrackUri] for why.
+     */
+    private fun prefetchTriviaFor(track: TrackInfo) {
+        // Don't prefetch for very short tracks - the boundary may arrive before generation
+        // finishes, and it would just waste a call.
+        if (track.durationMs in 1..45_000) {
+            Log.d(DJ_TAG, "Skipping prefetch for short track (${track.durationMs}ms)")
+            return
+        }
+
+        prefetchJob?.cancel() // a new track supersedes any in-flight prefetch for the old one
+        preparedTrackUri = null
+        preparedAudio = null
+
+        val gemini = geminiClient ?: return
+        prefetchJob = lifecycleScope.launch {
+            try {
+                Log.d(DJ_TAG, "Step 0: PREFETCH START for '${track.artist} - ${track.title}'")
+
+                // Prefer a script from the batch; only fall back to a dedicated call when this
+                // track wasn't in the batch (e.g. it came from search rather than the known mix).
+                val cacheKey = "${track.artist}|${track.title}"
+                val cached = scriptCache.remove(cacheKey)
+                val script = cached ?: gemini.generateTrackTransition(track.artist, track.title, nextTitle = null)
+                    .getOrElse {
+                        Log.w(DJ_TAG, "Step 0: prefetch script failed (${it.message}) - will retry live at the boundary")
+                        return@launch
+                    }
+                Log.d(DJ_TAG, "Step 0: script source = ${if (cached != null) "BATCH CACHE" else "individual call"}")
+                maybeRefillScriptBatch()
+                val wav = gemini.synthesizeSpeech(script).getOrElse {
+                    Log.w(DJ_TAG, "Step 0: prefetch TTS failed (${it.message}) - will retry live at the boundary")
+                    return@launch
+                }
+                preparedTrackUri = track.uri
+                preparedAudio = wav
+                Log.d(DJ_TAG, "Step 0: PREFETCH READY (${wav.size} bytes) for '${track.title}'")
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Step 0: prefetch threw", e)
+            }
+        }
+    }
+
+    /**
+     * Tops up [scriptCache] with one batched request covering the next few tracks in the
+     * published mix. Runs only when the cache is nearly empty, so it costs roughly one Gemini
+     * call per five songs instead of one per song.
+     */
+    private fun maybeRefillScriptBatch() {
+        if (scriptCache.size >= SCRIPT_REFILL_THRESHOLD) return
+        if (batchJob?.isActive == true) return // a refill is already in flight
+
+        val gemini = geminiClient ?: return
+        val upcoming = hourlyMixEngine?.lastPublishedTracks.orEmpty()
+        if (upcoming.isEmpty()) {
+            Log.d(DJ_TAG, "No published track list available - trivia stays per-track")
+            return
+        }
+
+        // Skip anything already cached or already played this cycle.
+        val candidates = upcoming
+            .filterNot { scriptCache.containsKey("${it.first}|${it.second}") }
+            .filterNot { "${it.first}|${it.second}" in consumedScriptKeys }
+            .take(SCRIPT_BATCH_SIZE)
+        if (candidates.isEmpty()) return
+
+        batchJob = lifecycleScope.launch {
+            try {
+                Log.d(DJ_TAG, "Step 0b: BATCH REQUEST for ${candidates.size} upcoming tracks")
+                val scripts = gemini.generateTrackTransitionBatch(candidates).getOrElse {
+                    Log.w(DJ_TAG, "Step 0b: batch failed (${it.message}) - falling back to per-track generation")
+                    return@launch
+                }
+                scriptCache.putAll(scripts)
+                consumedScriptKeys += scripts.keys
+                Log.d(DJ_TAG, "Step 0b: BATCH READY - ${scripts.size} scripts cached")
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Step 0b: batch threw", e)
+            }
+        }
+    }
+
+    /**
      * Rebuilds the current hour's playlist with fresh material and starts it.
      *
      * Requires the Spotify Web API connection: without it there's no playlist to rebuild, only
@@ -429,6 +546,9 @@ class RadioForegroundService : LifecycleService() {
                         return@launch
                     }
                 RadioServiceState.setCurrentGenre(genre)
+                // New playlist means the cached scripts describe tracks that are no longer queued.
+                scriptCache.clear()
+                consumedScriptKeys.clear()
                 spotifyManager?.playUri(uri)
                 updateStatus("Fresh $genre mix on air")
             } catch (e: Exception) {
@@ -513,6 +633,10 @@ class RadioForegroundService : LifecycleService() {
         Log.d(TAG, "Hour $hour -> segment $segment -> genre '$genre'")
         RadioServiceState.setDaySegment(segment)
         RadioServiceState.setCurrentGenre(genre)
+        // The hourly switch replaces the playlist, so previously batched scripts describe tracks
+        // that are no longer queued - same reasoning as the remix path.
+        scriptCache.clear()
+        consumedScriptKeys.clear()
 
         updateStatus("Building $genre mix for this hour...")
         val playlistUriResult = engine.buildAndPublishMixForGenre(genre)
@@ -530,10 +654,21 @@ class RadioForegroundService : LifecycleService() {
         }
 
         manager.playUri(playlistUri)
+        maybeRefillScriptBatch() // prime the first batch against the new playlist
         updateStatus("On air - $genre")
     }
 
     private suspend fun runTrackTrivia(track: TrackInfo) {
+        // Fast path: audio prepared at the start of this track is ready to play immediately.
+        val prepared = preparedAudio?.takeIf { preparedTrackUri == track.uri }
+        if (prepared != null) {
+            Log.d(DJ_TAG, "Step 2: using PREFETCHED audio for '${track.title}'")
+            preparedAudio = null
+            preparedTrackUri = null
+            playPreparedAudio(prepared, label = "Trivia")
+            return
+        }
+        Log.d(DJ_TAG, "Step 2: no prefetched audio - generating live (may miss the boundary)")
         val gemini = geminiClient ?: return
         Log.d(DJ_TAG, "Step 2: generating script for '${track.artist} - ${track.title}'")
         updateStatus("Writing trivia for ${track.title}...")
@@ -556,6 +691,24 @@ class RadioForegroundService : LifecycleService() {
      * indefinitely - the music would sit quiet forever with no error. Bailing out and letting
      * music continue is always better than a stuck DJ.
      */
+    /** Plays already-synthesized audio, reusing the same ducking + telemetry path as speakLine. */
+    private suspend fun playPreparedAudio(wav: ByteArray, label: String) {
+        updateStatus("$label: speaking...")
+        try {
+            val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
+                audioPlaybackManager.playDuckedAudio(wav)
+                true
+            }
+            if (played == null) Log.e(DJ_TAG, "Step 6: [$label] PLAYBACK TIMED OUT")
+            else Log.d(DJ_TAG, "Step 6: [$label] PLAYBACK COMPLETE (prefetched)")
+        } catch (e: Exception) {
+            Log.e(DJ_TAG, "[$label] prepared playback threw", e)
+        } finally {
+            updateStatus("On air")
+            spotifyManager?.play()
+        }
+    }
+
     private suspend fun speakLine(script: String, label: String) {
         val gemini = geminiClient
         val startedAt = System.currentTimeMillis()
@@ -694,6 +847,8 @@ class RadioForegroundService : LifecycleService() {
 
     override fun onDestroy() {
         spotifyManager?.disconnect()
+        prefetchJob?.cancel()
+        batchJob?.cancel()
         RadioServiceState.setRunning(false)
         localTts?.release()
         audioPlaybackManager.release()

@@ -38,6 +38,13 @@ class GeminiClient(
     private val apiKey: String,
     private val language: DjLanguage = DjLanguage.HEBREW
 ) {
+    /**
+     * Per-process cache of generated artist lists. Genre->artists mappings are effectively static
+     * between mixes, so re-asking on every playlist rebuild burns quota for no new information -
+     * a meaningful cause of 429s on free-tier keys.
+     */
+    private val artistListCache = mutableMapOf<String, List<String>>()
+
     private val client: OkHttpClient by lazy {
         val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
         OkHttpClient.Builder()
@@ -306,6 +313,59 @@ class GeminiClient(
     suspend fun generateTrackTransition(currentArtist: String, currentTitle: String, nextTitle: String?): Result<String> =
         generateScript(trackTransitionPrompt(currentArtist, currentTitle, nextTitle))
 
+    /**
+     * Generates transition scripts for several upcoming tracks in ONE request.
+     *
+     * Script generation is the easiest place to cut Gemini call volume: five separate trivia
+     * calls become one. (TTS cannot be batched - each request returns a single audio stream - so
+     * audio is still synthesized per track, just later and lazily.)
+     *
+     * Returns a map of "artist|title" -> script. Keyed on the input pair rather than array
+     * position because a model that drops or reorders an entry would otherwise silently attach
+     * the wrong trivia to the wrong song, which is worse than having no trivia.
+     */
+    suspend fun generateTrackTransitionBatch(
+        tracks: List<Pair<String, String>> // artist to title
+    ): Result<Map<String, String>> {
+        if (tracks.isEmpty()) return Result.success(emptyMap())
+
+        val numbered = tracks.mapIndexed { i, (artist, title) -> "${i + 1}. \"$title\" by $artist" }
+            .joinToString("\n")
+        val prompt = """
+            ${persona()}
+
+            המשימה / Task: write ONE short radio transition for EACH of the following ${tracks.size} tracks.
+            Each one must follow all the persona rules above, in the same language as those rules.
+
+            $numbered
+
+            Output format - this is critical:
+            - Return ONLY a JSON array of ${tracks.size} objects, nothing else. No markdown fences,
+              no commentary before or after.
+            - Each object: {"n": <track number>, "script": "<the spoken text>"}
+            - The "script" value must be plain speakable text with no quotation marks inside it.
+        """.trimIndent()
+
+        return generateScript(prompt).mapCatching { raw ->
+            // Models frequently wrap JSON in markdown fences despite instructions to the contrary.
+            val cleaned = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+            val array = JSONArray(cleaned)
+            val result = mutableMapOf<String, String>()
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val n = obj.optInt("n", -1)
+                val script = obj.optString("script").takeIf { it.isNotBlank() } ?: continue
+                // Map back by the number the model was given, so a dropped or reordered entry
+                // can't misalign scripts with tracks.
+                val track = tracks.getOrNull(n - 1) ?: continue
+                result["${track.first}|${track.second}"] = script.trim()
+            }
+            if (result.isEmpty()) throw IOException("Batch returned no usable scripts")
+            Log.d(TAG, "Batch generated ${result.size}/${tracks.size} scripts in one call")
+            result
+        }
+    }
+
     suspend fun generateHourlyNews(headlines: List<String>, likedTopics: List<String> = emptyList()): Result<String> =
         generateScript(hourlyNewsPrompt(headlines, likedTopics))
 
@@ -322,7 +382,23 @@ class GeminiClient(
      * names, and every name it returns is resolved through Spotify search, so a hallucinated
      * artist simply yields no results and is skipped.
      */
-    suspend fun suggestMainstreamArtists(genre: String, count: Int = 10): Result<List<String>> {
+    suspend fun suggestMainstreamArtists(
+        genre: String,
+        count: Int = 10,
+        songLanguage: String? = null
+    ): Result<List<String>> {
+        // Artist lists for a genre barely change between mixes, so caching them removes a whole
+        // API call per playlist rebuild. That call volume is a direct contributor to 429 rate
+        // limiting on free-tier keys, and it competes with the trivia calls that actually matter.
+        val cacheKey = "mainstream:${genre.lowercase()}:${songLanguage ?: "any"}"
+        artistListCache[cacheKey]?.let {
+            Log.d(TAG, "Using cached mainstream artists for '$genre'")
+            return Result.success(it)
+        }
+
+        val languageRule = songLanguage?.let {
+            "\n            - CRITICAL: only artists who primarily perform in $it."
+        } ?: ""
         val prompt = """
             List exactly $count well-known, mainstream, widely-recognised recording artists in the
             "$genre" genre - the kind of names a general listener would recognise, not obscure or
@@ -330,10 +406,10 @@ class GeminiClient(
 
             Hard rules:
             - Only real, existing recording artists.
-            - Favour commercially successful and widely played artists.
+            - Favour commercially successful and widely played artists.$languageRule
             - Output ONLY the artist names, one per line. No numbering, no commentary, no blank lines.
         """.trimIndent()
-        return generateScript(prompt).map { parseArtistList(it, count) }
+        return generateScript(prompt).map { parseArtistList(it, count).also { list -> artistListCache[cacheKey] = list } }
     }
 
     /**
@@ -353,9 +429,15 @@ class GeminiClient(
     suspend fun suggestSimilarArtists(
         seedArtists: List<String>,
         genre: String,
-        count: Int = 8
+        count: Int = 8,
+        songLanguage: String? = null
     ): Result<List<String>> {
         if (seedArtists.isEmpty()) return Result.success(emptyList())
+        val cacheKey = "similar:${genre.lowercase()}:${songLanguage ?: "any"}:${seedArtists.take(5).joinToString(",").lowercase()}"
+        artistListCache[cacheKey]?.let {
+            Log.d(TAG, "Using cached similar artists for '$genre'")
+            return Result.success(it)
+        }
         val prompt = """
             You are a music recommendation engine. A listener's favourite artists include:
             ${seedArtists.take(12).joinToString(", ")}
@@ -365,7 +447,7 @@ class GeminiClient(
 
             Hard rules:
             - Do NOT include any artist already listed above.
-            - Only suggest real, existing recording artists.
+            - Only suggest real, existing recording artists.${songLanguage?.let { "\n            - CRITICAL: only artists who primarily perform in $it." } ?: ""}
             - Output ONLY the artist names, one per line. No numbering, no commentary, no genres,
               no explanations, no blank lines.
         """.trimIndent()
@@ -374,6 +456,7 @@ class GeminiClient(
             parseArtistList(raw, count)
                 // Guard against the model echoing a seed artist back despite being told not to.
                 .filterNot { suggestion -> seedArtists.any { it.equals(suggestion, ignoreCase = true) } }
+                .also { artistListCache[cacheKey] = it }
         }
     }
 

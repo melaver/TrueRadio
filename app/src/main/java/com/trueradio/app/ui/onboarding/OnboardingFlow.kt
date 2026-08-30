@@ -16,6 +16,7 @@ import com.trueradio.app.NewsPreferences
 import com.trueradio.app.GenreAnchors
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
+import com.trueradio.app.SongLanguage
 import com.trueradio.app.ui.components.GenreArtistSeedEditor
 import com.trueradio.app.ui.components.SectionHeader
 import com.trueradio.app.ui.components.SelectableChipGrid
@@ -213,6 +214,7 @@ private fun PreferencesStep(settings: SecureSettings) {
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
+    val songLanguage by settings.songLanguage.collectAsState(initial = SongLanguage.ANY)
 
     var activeSegment by rememberSaveable { mutableStateOf(DaySegment.MORNING) }
 
@@ -224,6 +226,14 @@ private fun PreferencesStep(settings: SecureSettings) {
             options = DjLanguage.entries.toList(),
             selected = djLanguage,
             onSelect = { scope.launch { settings.saveDjLanguage(it) } },
+            label = { it.displayName }
+        )
+
+        SectionHeader("Song language", "Optional. Biases which artists get picked; not an exact filter.")
+        SingleChoiceChipGrid(
+            options = SongLanguage.entries.toList(),
+            selected = songLanguage,
+            onSelect = { scope.launch { settings.saveSongLanguage(it) } },
             label = { it.displayName }
         )
 
@@ -260,11 +270,13 @@ private fun PreferencesStep(settings: SecureSettings) {
                 GenreArtistSeedEditor(
                     genre = genre,
                     artists = genreAnchors.artistsFor(genre),
-                    onAdd = { artist ->
-                        scope.launch { settings.saveGenreAnchors(genreAnchors.withArtist(genre, artist)) }
-                    },
-                    onRemove = { artist ->
-                        scope.launch { settings.saveGenreAnchors(genreAnchors.withoutArtist(genre, artist)) }
+                    onArtistsChanged = { list ->
+                        scope.launch {
+                            var updated = genreAnchors.copy(
+                                byGenre = genreAnchors.byGenre + (genre.lowercase() to list)
+                            )
+                            settings.saveGenreAnchors(updated)
+                        }
                     }
                 )
             }

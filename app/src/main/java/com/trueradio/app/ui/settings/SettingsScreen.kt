@@ -22,6 +22,7 @@ import com.trueradio.app.NewsPreferences
 import com.trueradio.app.NewsSource
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
+import com.trueradio.app.SongLanguage
 import com.trueradio.app.service.RadioServiceState
 import com.trueradio.app.ThemeMode
 import com.trueradio.app.ui.components.GenreArtistSeedEditor
@@ -51,6 +52,7 @@ fun SettingsScreen(
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
+    val songLanguage by settings.songLanguage.collectAsState(initial = SongLanguage.ANY)
     val savedSpotifyId by settings.spotifyClientId.collectAsState(initial = "")
     val savedGeminiKey by settings.geminiApiKey.collectAsState(initial = "")
 
@@ -100,6 +102,19 @@ fun SettingsScreen(
             )
 
             HorizontalDivider()
+            SectionHeader(
+                "Song language",
+                "Biases artist selection toward this language. Spotify has no language field, so " +
+                    "it can't be exact - and your own saved/top tracks are never filtered out."
+            )
+            SingleChoiceChipGrid(
+                options = SongLanguage.entries.toList(),
+                selected = songLanguage,
+                onSelect = { scope.launch { settings.saveSongLanguage(it) } },
+                label = { it.displayName }
+            )
+
+            HorizontalDivider()
             SectionHeader("Music genres by time of day")
             SingleChoiceChipGrid(
                 options = DaySegment.entries.toList(),
@@ -130,15 +145,17 @@ fun SettingsScreen(
                 )
                 selectedForSegment.forEach { genre ->
                     GenreArtistSeedEditor(
-                        genre = genre,
-                        artists = genreAnchors.artistsFor(genre),
-                        onAdd = { artist ->
-                            scope.launch { settings.saveGenreAnchors(genreAnchors.withArtist(genre, artist)) }
-                        },
-                        onRemove = { artist ->
-                            scope.launch { settings.saveGenreAnchors(genreAnchors.withoutArtist(genre, artist)) }
+                    genre = genre,
+                    artists = genreAnchors.artistsFor(genre),
+                    onArtistsChanged = { list ->
+                        scope.launch {
+                            var updated = genreAnchors.copy(
+                                byGenre = genreAnchors.byGenre + (genre.lowercase() to list)
+                            )
+                            settings.saveGenreAnchors(updated)
                         }
-                    )
+                    }
+                )
                 }
             }
 

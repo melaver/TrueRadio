@@ -36,6 +36,15 @@ class HourlyMixEngine(
      */
     private val geminiClient: GeminiClient? = null
 ) {
+    /**
+     * Ordered artist/title pairs of the most recently published mix. App Remote exposes no queue
+     * API, so this is the only way the service can know what's coming up in order to pre-generate
+     * trivia for it.
+     */
+    @Volatile
+    var lastPublishedTracks: List<Pair<String, String>> = emptyList()
+        private set
+
     companion object {
         private const val TAG = "HourlyMixEngine"
         private const val PLAYLIST_NAME = "TrueRadio Hourly Mix"
@@ -125,6 +134,11 @@ class HourlyMixEngine(
         // was on a playlist they left running).
         // Genre-specific anchor artists the user named for this genre (Settings > Favourite
         // artists per genre). Primary steering signal for what this hour should sound like.
+        // Language preference steers artist selection only - see SongLanguage for why it can't
+        // be a hard filter (Spotify exposes no language field on tracks or artists).
+        val songLanguage = settings.snapshotSongLanguage().promptName
+        if (songLanguage != null) Log.d(TAG, "Song language preference: $songLanguage")
+
         val anchors = settings.snapshotGenreAnchors().artistsFor(genre)
         if (anchors.isNotEmpty()) Log.d(TAG, "Anchors for '$genre': ${anchors.joinToString(", ")}")
 
@@ -213,7 +227,8 @@ class HourlyMixEngine(
             // a larger share of the hour than it would from inferred seeds alone.
             limit = if (anchors.isNotEmpty()) quota(SHARE_DISCOVERY * 1.5) else quota(SHARE_DISCOVERY),
             excludeUris = dislikedUris,
-            excludeArtists = blockedArtists
+            excludeArtists = blockedArtists,
+            songLanguage = songLanguage
         )
         Log.d(TAG, "Tier DISCOVERY: ${discoveryTier.size}")
 
@@ -224,7 +239,7 @@ class HourlyMixEngine(
         if (curated.size < TARGET_TRACK_COUNT) {
             // Tier 5a: mainstream artists named by Gemini, as a stand-in for the popularity
             // filter Spotify no longer offers (see suggestMainstreamArtists).
-            geminiClient?.suggestMainstreamArtists(genre)?.getOrNull()?.let { mainstream ->
+            geminiClient?.suggestMainstreamArtists(genre, songLanguage = songLanguage)?.getOrNull()?.let { mainstream ->
                 Log.d(TAG, "Mainstream fill artists: ${mainstream.joinToString(", ")}")
                 for (name in mainstream) {
                     if (curated.size >= TARGET_TRACK_COUNT) break
@@ -247,11 +262,18 @@ class HourlyMixEngine(
             Log.d(TAG, "After genre fill: ${curated.size}")
         }
 
+        // Lookup so the published URIs can be reported back with artist/title for trivia
+        // pre-generation. Built from every track object seen while assembling the mix.
+        val nameByUri = (savedTracks + allTopTracks).associate { it.uri to (it.artistName to it.name) }
+
         val finalUris = curated.distinct().take(TARGET_TRACK_COUNT)
         if (finalUris.isEmpty()) {
             return Result.failure(IllegalStateException("Could not find any tracks for genre '$genre' - try a broader genre name"))
         }
         Log.d(TAG, "Publishing ${finalUris.size} tracks for genre '$genre'")
+        // Only tracks whose names we captured can be pre-generated for; search-sourced URIs
+        // simply fall back to live generation at their boundary.
+        lastPublishedTracks = finalUris.mapNotNull { nameByUri[it] }
 
         val replaceResult = webApi.replacePlaylistTracks(playlistId, finalUris)
         if (replaceResult.isFailure) {
@@ -276,12 +298,13 @@ class HourlyMixEngine(
         genre: String,
         limit: Int,
         excludeUris: Set<String> = emptySet(),
-        excludeArtists: Set<String> = emptySet()
+        excludeArtists: Set<String> = emptySet(),
+        songLanguage: String? = null
     ): List<String> {
         val gemini = geminiClient ?: return emptyList()
         if (seeds.isEmpty()) return emptyList()
 
-        val suggestions = gemini.suggestSimilarArtists(seeds, genre).getOrElse {
+        val suggestions = gemini.suggestSimilarArtists(seeds, genre, songLanguage = songLanguage).getOrElse {
             Log.w(TAG, "Artist suggestion failed; skipping discovery tier", it)
             return emptyList()
         }
