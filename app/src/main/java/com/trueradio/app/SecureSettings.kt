@@ -36,6 +36,7 @@ class SecureSettings(private val context: Context) {
         val ONBOARDING_COMPLETE = stringPreferencesKey("onboarding_complete")
         val SEGMENT_GENRES = stringPreferencesKey("segment_genres")
         val TRACK_FEEDBACK = stringPreferencesKey("track_feedback")
+        val GENRE_ANCHORS = stringPreferencesKey("genre_anchors")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -66,6 +67,9 @@ class SecureSettings(private val context: Context) {
     }
     val trackFeedback: Flow<TrackFeedback> = context.dataStore.data.map {
         TrackFeedback.deserialize(it[Keys.TRACK_FEEDBACK] ?: "")
+    }
+    val genreAnchors: Flow<GenreAnchors> = context.dataStore.data.map {
+        GenreAnchors.deserialize(it[Keys.GENRE_ANCHORS] ?: "")
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -134,6 +138,10 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.TRACK_FEEDBACK] = feedback.serialize() }
     }
 
+    suspend fun saveGenreAnchors(anchors: GenreAnchors) {
+        context.dataStore.edit { prefs -> prefs[Keys.GENRE_ANCHORS] = anchors.serialize() }
+    }
+
     suspend fun setOnboardingComplete(complete: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.ONBOARDING_COMPLETE] = complete.toString() }
     }
@@ -151,4 +159,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotOnboardingComplete(): Boolean = onboardingComplete.first()
     suspend fun snapshotSegmentGenres(): SegmentGenres = segmentGenres.first()
     suspend fun snapshotTrackFeedback(): TrackFeedback = trackFeedback.first()
+    suspend fun snapshotGenreAnchors(): GenreAnchors = genreAnchors.first()
 }

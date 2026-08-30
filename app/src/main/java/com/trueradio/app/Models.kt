@@ -311,6 +311,59 @@ data class TrackFeedback(
     }
 }
 
+/**
+ * Per-genre "anchor" artists: 3-5 acts the user names as defining the vibe they want from a
+ * genre. These are seeds, NOT a whitelist - the mix uses them to steer similarity expansion, and
+ * deliberately caps how much of the playlist they occupy directly (see HourlyMixEngine), so the
+ * hour stays varied instead of looping the same five artists.
+ */
+data class GenreAnchors(
+    val byGenre: Map<String, List<String>> = emptyMap()
+) {
+    fun artistsFor(genre: String): List<String> =
+        byGenre[genre.lowercase()].orEmpty()
+
+    fun withArtist(genre: String, artist: String): GenreAnchors {
+        val key = genre.lowercase()
+        val trimmed = artist.trim()
+        if (trimmed.isBlank()) return this
+        val current = byGenre[key].orEmpty()
+        // Case-insensitive dedupe so "Radiohead" and "radiohead" don't both get stored.
+        if (current.any { it.equals(trimmed, ignoreCase = true) }) return this
+        return copy(byGenre = byGenre + (key to (current + trimmed).take(MAX_PER_GENRE)))
+    }
+
+    fun withoutArtist(genre: String, artist: String): GenreAnchors {
+        val key = genre.lowercase()
+        val current = byGenre[key].orEmpty()
+        return copy(byGenre = byGenre + (key to current.filterNot { it.equals(artist, ignoreCase = true) }))
+    }
+
+    /** Serialized as "genre\u0001artist,artist|genre\u0001artist" - delimiters stripped from values. */
+    fun serialize(): String = byGenre.entries
+        .filter { it.value.isNotEmpty() }
+        .joinToString("|") { (genre, artists) ->
+            genre.replace("|", "").replace("\u0001", "") + "\u0001" +
+                artists.joinToString(",") { it.replace(",", " ").replace("|", " ").trim() }
+        }
+
+    companion object {
+        const val MAX_PER_GENRE = 5
+        const val RECOMMENDED_MIN = 3
+
+        fun deserialize(blob: String): GenreAnchors {
+            if (blob.isBlank()) return GenreAnchors()
+            val map = blob.split("|").mapNotNull { entry ->
+                val parts = entry.split("\u0001")
+                if (parts.size != 2 || parts[0].isBlank()) return@mapNotNull null
+                val artists = parts[1].split(",").map { it.trim() }.filter { it.isNotBlank() }
+                if (artists.isEmpty()) null else parts[0] to artists
+            }.toMap()
+            return GenreAnchors(map)
+        }
+    }
+}
+
 /** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */
 enum class DjLanguage(val displayName: String) {
     HEBREW("עברית"),

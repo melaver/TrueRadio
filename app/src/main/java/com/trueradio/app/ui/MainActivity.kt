@@ -71,7 +71,9 @@ class MainActivity : ComponentActivity() {
                         onStartRadio = { clientId -> startDjService(clientId) },
                         onStopRadio = { stopDjService() },
                         onLike = { sendServiceAction(RadioForegroundService.ACTION_LIKE) },
-                        onDislike = { sendServiceAction(RadioForegroundService.ACTION_DISLIKE) }
+                        onDislike = { sendServiceAction(RadioForegroundService.ACTION_DISLIKE) },
+                        onForceDj = { sendServiceAction(RadioForegroundService.ACTION_FORCE_DJ) },
+                        onRemix = { sendServiceAction(RadioForegroundService.ACTION_REMIX) }
                     )
                 }
             }

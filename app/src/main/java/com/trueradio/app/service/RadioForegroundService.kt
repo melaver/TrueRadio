@@ -56,6 +56,10 @@ class RadioForegroundService : LifecycleService() {
         const val ACTION_PLAY_PAUSE = "com.trueradio.app.action.PLAY_PAUSE"
         const val ACTION_LIKE = "com.trueradio.app.action.LIKE"
         const val ACTION_DISLIKE = "com.trueradio.app.action.DISLIKE"
+        /** Debug-only: run the DJ flow immediately regardless of track position. */
+        const val ACTION_FORCE_DJ = "com.trueradio.app.action.FORCE_DJ"
+        /** Rebuild this hour's mix on demand with fresh material and start playing it. */
+        const val ACTION_REMIX = "com.trueradio.app.action.REMIX"
         const val EXTRA_SPOTIFY_CLIENT_ID = "extra_spotify_client_id"
         private const val NOTIFICATION_ID = 42
         private const val TRIVIA_TRIGGER_WINDOW_MS = 15_000L
@@ -65,7 +69,12 @@ class RadioForegroundService : LifecycleService() {
          * news flash queued to fire the instant you resume.
          */
         private const val NEWS_INTERVAL_PLAYBACK_MS = 20 * 60 * 1000L // 20 minutes of music
-        private const val PLAYBACK_TICK_MS = 10_000L
+        /**
+         * 2s, not 10s: the trivia window is only ~15s wide, so a coarse tick could step straight
+         * over it (…20s left, tick, 8s left) and miss the boundary entirely.
+         */
+        private const val PLAYBACK_TICK_MS = 2_000L
+        private const val DJ_TAG = "DJ_FLOW"
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
         private const val TAG = "RadioDJService"
         /**
@@ -90,7 +99,27 @@ class RadioForegroundService : LifecycleService() {
     private var lastTrackUri: String? = null
     // Full current track, needed so like/dislike can record artist as well as URI.
     private var currentTrack: TrackInfo? = null
-    private var hasFiredTriviaForCurrentTrack = false
+
+    /**
+     * Wall-clock time the last PlayerState arrived, used to PROJECT the current playback position
+     * between events. App Remote only emits on state *changes*, so during steady playback of a
+     * 4-minute track there may be no events at all inside the 15s trivia window - reading
+     * positionMs straight off the last event would have it frozen minutes in the past. Projection
+     * gives a continuously-accurate position without polling the SDK.
+     */
+    private var lastStateTimestampMs: Long = 0L
+
+    /**
+     * URI of the track whose DJ segment has already been handled. Guards against double-triggers:
+     * a boolean flag alone breaks when a track repeats (same URI, needs re-arming) or when
+     * several ticks land inside the same window before the mutex is taken.
+     */
+    private var lastProcessedTrackId: String? = null
+
+    /** Incremented per manual remix so each one reaches different material - see HourlyMixEngine. */
+    private var remixCount = 0
+    /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
+    private var isRemixing = false
     // Accumulated milliseconds of actual playback since the last news flash.
     private var playbackMsSinceNews = 0L
     private var lastGenreSwitchHour = -1
@@ -140,6 +169,14 @@ class RadioForegroundService : LifecycleService() {
             }
             ACTION_PLAY_PAUSE -> {
                 togglePlayback()
+                return START_STICKY
+            }
+            ACTION_REMIX -> {
+                remixCurrentMix()
+                return START_STICKY
+            }
+            ACTION_FORCE_DJ -> {
+                forceDjTransition()
                 return START_STICKY
             }
             ACTION_LIKE -> {
@@ -213,18 +250,40 @@ class RadioForegroundService : LifecycleService() {
     }
 
     private fun onPlayerState(track: TrackInfo) {
+        val previous = currentTrack
         currentTrack = track
-        if (track.uri != lastTrackUri) {
+        lastStateTimestampMs = System.currentTimeMillis()
+
+        // Re-arm on a genuine new track OR on a restart of the same one. Keying only on URI would
+        // permanently suppress trivia for a track played twice in a row (repeat-one, or a replay),
+        // since its URI never changes.
+        val isNewTrack = track.uri != lastTrackUri
+        val restartedSameTrack = !isNewTrack && previous != null &&
+            track.positionMs + 5_000 < previous.positionMs // position jumped backwards = restart/seek
+        if (isNewTrack || restartedSameTrack) {
+            Log.d(DJ_TAG, "Track changed: ${track.artist} - ${track.title} (${track.durationMs}ms), re-arming DJ")
             lastTrackUri = track.uri
-            hasFiredTriviaForCurrentTrack = false
+            lastProcessedTrackId = null
         }
 
         updateNotification("${track.artist} - ${track.title}", track.isPaused)
 
         if (speakingMutex.isLocked || track.isPaused) return
-
         maybeTriggerGenreSwitch()
-        maybeTriggerTrackTrivia(track)
+    }
+
+    /**
+     * Playback position projected forward from the last PlayerState event. Returns null when
+     * paused or when no state has arrived yet.
+     */
+    private fun projectedPosition(): Pair<TrackInfo, Long>? {
+        val track = currentTrack ?: return null
+        if (track.isPaused || lastStateTimestampMs == 0L) return null
+        val elapsed = System.currentTimeMillis() - lastStateTimestampMs
+        val projected = track.positionMs + elapsed
+        // Guard against a stale event projecting past the end of the track.
+        if (track.durationMs > 0 && projected > track.durationMs + 30_000) return null
+        return track to projected
     }
 
     /**
@@ -240,10 +299,13 @@ class RadioForegroundService : LifecycleService() {
             while (isActive) {
                 delay(PLAYBACK_TICK_MS)
                 if (lastKnownIsPaused) continue // only count time the music is actually playing
+
                 playbackMsSinceNews += PLAYBACK_TICK_MS
                 if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
                     maybeTriggerNewsFlash()
+                    continue // don't also evaluate trivia on the same tick
                 }
+                maybeTriggerTrackTrivia()
             }
         }
     }
@@ -287,18 +349,113 @@ class RadioForegroundService : LifecycleService() {
         }
     }
 
-    /** Between-track trivia: fires once per track when ~15s remain before it ends. */
-    private fun maybeTriggerTrackTrivia(track: TrackInfo) {
-        if (hasFiredTriviaForCurrentTrack) return
+    /**
+     * Between-track trivia: fires exactly once per track when ~15s remain.
+     *
+     * Driven by the ticker using a projected position rather than by PlayerState callbacks -
+     * see [projectedPosition] for why event-driven detection missed the window entirely.
+     */
+    private fun maybeTriggerTrackTrivia() {
+        val (track, position) = projectedPosition() ?: return
         if (track.durationMs <= 0) return
-        val remaining = track.durationMs - track.positionMs
-        if (remaining !in 0..TRIVIA_TRIGGER_WINDOW_MS) return
-        if (!speakingMutex.tryLock()) return // something else is already speaking; if the ~15s window
-        // closes before it frees up, this track's trivia is simply skipped (hasFiredTriviaForCurrentTrack
-        // stays false, but the next track resets it anyway) - a rare missed line beats overlapping speech.
+        if (track.uri == lastProcessedTrackId) return // already handled this track
 
-        hasFiredTriviaForCurrentTrack = true
-        Log.d(TAG, "Trivia triggered for ${track.artist} - ${track.title} (${track.durationMs - track.positionMs}ms left)")
+        val remaining = track.durationMs - position
+        if (remaining !in 0..TRIVIA_TRIGGER_WINDOW_MS) return
+
+        // Claim the track id BEFORE taking the mutex. Ticks are 2s apart and the window is ~15s,
+        // so several ticks fall inside it; without claiming first, a slow mutex handoff could let
+        // two of them both pass the check and fire duplicate Gemini calls for one boundary.
+        lastProcessedTrackId = track.uri
+
+        if (!speakingMutex.tryLock()) {
+            Log.d(DJ_TAG, "Step 1: boundary hit for '${track.title}' but DJ busy - skipping this one")
+            return
+        }
+
+        Log.d(DJ_TAG, "Step 1: DETECTED boundary - '${track.artist} - ${track.title}', ${remaining}ms remaining")
+        lifecycleScope.launch {
+            try {
+                runTrackTrivia(track)
+            } finally {
+                speakingMutex.unlock()
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the current hour's playlist with fresh material and starts it.
+     *
+     * Requires the Spotify Web API connection: without it there's no playlist to rebuild, only
+     * the static fallback playlists, so remix is a no-op rather than a silent misleading success.
+     */
+    private fun remixCurrentMix() {
+        val engine = hourlyMixEngine
+        if (engine == null || spotifyWebAuthManager == null) {
+            Log.w(TAG, "Remix unavailable - Spotify Web API not connected")
+            updateStatus("Connect your Spotify account to remix")
+            return
+        }
+        if (isRemixing) {
+            Log.d(TAG, "Remix already in progress; ignoring")
+            return
+        }
+        isRemixing = true
+        remixCount++
+
+        lifecycleScope.launch {
+            try {
+                if (spotifyWebAuthManager?.isConnected() != true) {
+                    updateStatus("Connect your Spotify account to remix")
+                    return@launch
+                }
+                val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                val segment = DaySegment.forHour(hour)
+                // Reuse whatever genre is actually on air; fall back to the daypart's first
+                // configured genre if the service hasn't built a mix yet this session.
+                val genre = RadioServiceState.currentGenre.value
+                    ?: settings.snapshotSegmentGenres().genresFor(segment).firstOrNull()
+                if (genre == null) {
+                    updateStatus("No genre configured for this time of day")
+                    return@launch
+                }
+
+                updateStatus("Remixing $genre...")
+                Log.d(TAG, "Remix #$remixCount for genre '$genre'")
+                val uri = engine.buildAndPublishMixForGenre(genre, variation = remixCount)
+                    .getOrElse {
+                        Log.e(TAG, "Remix failed", it)
+                        updateStatus("Remix failed: ${it.message}")
+                        return@launch
+                    }
+                RadioServiceState.setCurrentGenre(genre)
+                spotifyManager?.playUri(uri)
+                updateStatus("Fresh $genre mix on air")
+            } catch (e: Exception) {
+                Log.e(TAG, "Remix threw", e)
+                updateStatus("Remix failed")
+            } finally {
+                isRemixing = false
+            }
+        }
+    }
+
+    /**
+     * Debug entry point for ACTION_FORCE_DJ: runs the full DJ flow against whatever is playing,
+     * ignoring track position, so the pipeline can be verified without waiting for a song to end.
+     */
+    private fun forceDjTransition() {
+        val track = currentTrack
+        if (track == null) {
+            Log.e(DJ_TAG, "FORCE: no current track - is Spotify playing?")
+            updateStatus("Force DJ: nothing is playing")
+            return
+        }
+        if (!speakingMutex.tryLock()) {
+            Log.w(DJ_TAG, "FORCE: DJ already speaking, ignoring")
+            return
+        }
+        Log.d(DJ_TAG, "FORCE: manually triggering DJ for '${track.artist} - ${track.title}'")
         lifecycleScope.launch {
             try {
                 runTrackTrivia(track)
@@ -354,6 +511,8 @@ class RadioForegroundService : LifecycleService() {
             rotation.genreForHour(hour, daySeed)
         } ?: return
         Log.d(TAG, "Hour $hour -> segment $segment -> genre '$genre'")
+        RadioServiceState.setDaySegment(segment)
+        RadioServiceState.setCurrentGenre(genre)
 
         updateStatus("Building $genre mix for this hour...")
         val playlistUriResult = engine.buildAndPublishMixForGenre(genre)
@@ -376,11 +535,13 @@ class RadioForegroundService : LifecycleService() {
 
     private suspend fun runTrackTrivia(track: TrackInfo) {
         val gemini = geminiClient ?: return
+        Log.d(DJ_TAG, "Step 2: generating script for '${track.artist} - ${track.title}'")
         updateStatus("Writing trivia for ${track.title}...")
         // In a fuller implementation, look ahead at Spotify's queue/context to know the next
         // track title; here we pass null and let the DJ speak generically about "the next song".
         val scriptResult = gemini.generateTrackTransition(track.artist, track.title, nextTitle = null)
         val script = scriptResult.getOrElse {
+            Log.e(DJ_TAG, "Step 2: SCRIPT GENERATION FAILED - ${it.message}; segment aborted, music unaffected")
             updateStatus("Trivia generation failed: ${it.message}")
             return
         }
@@ -397,7 +558,8 @@ class RadioForegroundService : LifecycleService() {
      */
     private suspend fun speakLine(script: String, label: String) {
         val gemini = geminiClient
-        Log.d(TAG, "[$label] speak start: \"${script.take(60)}...\"")
+        val startedAt = System.currentTimeMillis()
+        Log.d(DJ_TAG, "Step 3: [$label] API REQUEST START - script: \"${script.take(60)}...\"")
         updateStatus("$label: speaking...")
 
         try {
@@ -406,23 +568,27 @@ class RadioForegroundService : LifecycleService() {
             }
 
             if (wav != null) {
-                Log.d(TAG, "[$label] Gemini TTS ok (${wav.size} bytes)")
+                Log.d(DJ_TAG, "Step 4: [$label] API SUCCESS - ${wav.size} bytes in ${System.currentTimeMillis() - startedAt}ms")
                 val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
                     audioPlaybackManager.playDuckedAudio(wav)
                     true
                 }
-                if (played == null) Log.e(TAG, "[$label] playback timed out; releasing focus")
+                if (played == null) {
+                    Log.e(DJ_TAG, "Step 6: [$label] PLAYBACK TIMED OUT - focus released by cancellation")
+                } else {
+                    Log.d(DJ_TAG, "Step 6: [$label] PLAYBACK COMPLETE")
+                }
             } else {
-                Log.w(TAG, "[$label] Gemini TTS unavailable - falling back to on-device TTS")
+                Log.w(DJ_TAG, "Step 4: [$label] API FAILED after ${System.currentTimeMillis() - startedAt}ms - falling back to on-device TTS")
                 val spoke = localTts?.speak(script, djLanguage) ?: false
-                if (!spoke) Log.e(TAG, "[$label] on-device TTS also failed; skipping DJ line")
+                Log.d(DJ_TAG, "Step 6: [$label] fallback TTS ${if (spoke) "COMPLETE" else "FAILED - segment skipped"}")
             }
         } catch (e: Exception) {
             // Never let a DJ failure kill the service or leave music ducked.
-            Log.e(TAG, "[$label] speech path threw", e)
+            Log.e(DJ_TAG, "[$label] speech path threw - aborting segment", e)
         } finally {
             updateStatus("On air")
-            Log.d(TAG, "[$label] speak finished")
+            Log.d(DJ_TAG, "Step 7: [$label] SEGMENT END - restoring Spotify")
             spotifyManager?.play() // resume in case the OS paused rather than ducked
         }
     }

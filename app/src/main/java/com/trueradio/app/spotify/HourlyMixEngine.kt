@@ -43,6 +43,20 @@ class HourlyMixEngine(
         private const val TARGET_TRACK_COUNT = 30
         private const val SEARCH_PAGE_SIZE = 10 // Spotify's Feb 2026 search `limit` cap
 
+        /**
+         * Hard cap on how deep genre search paginates. Search results are relevance-ranked, so
+         * page 1 holds the recognisable artists and each further page is progressively more
+         * obscure. The fill loop previously paged without limit (offset 10, 20, 30...), which -
+         * with the Feb 2026 cap dropping search `limit` from 50 to 10 - routinely reached page 3+
+         * and was the main reason mixes filled up with anonymous artists. Staying shallow keeps
+         * the fill material mainstream; if that can't fill the hour, a shorter playlist of decent
+         * tracks beats a full one padded with obscurities.
+         */
+        private const val MAX_SEARCH_OFFSET = 20
+
+        /** How far each successive remix shifts into the candidate pool. */
+        private const val REMIX_OFFSET_STEP = 5
+
         // Target share of the mix per tier. Familiar material dominates so the hour feels like
         // *your* station, with a deliberate slice reserved for discovery so it isn't just a
         // rotation of things you've already heard to death.
@@ -50,6 +64,15 @@ class HourlyMixEngine(
         private const val SHARE_TOP = 0.30          // your most-played
         private const val SHARE_DEEP_CUTS = 0.15    // more from artists you already love
         private const val SHARE_DISCOVERY = 0.20    // Gemini-suggested adjacent artists
+
+        /**
+         * Cap on how much of the mix the user's own anchor artists may occupy DIRECTLY. They are
+         * seeds that define a vibe, not a whitelist - letting them fill the hour would turn a
+         * radio station into a 5-artist loop, which is exactly what the feature is meant to
+         * avoid. Their real influence is much larger than this number suggests, because they also
+         * drive the similarity expansion that feeds the discovery tier.
+         */
+        private const val SHARE_ANCHORS = 0.20
     }
 
     /**
@@ -72,7 +95,16 @@ class HourlyMixEngine(
      *
      * Tiers are shuffled internally but concatenated in order, so familiar material leads.
      */
-    suspend fun buildAndPublishMixForGenre(genre: String): Result<String> {
+    /**
+     * @param variation bumped on each manual remix. Tier shuffles alone would re-order the *same*
+     * candidate pool, so a remix would return largely the same 30 tracks in a new order. Varying
+     * the search offset actually reaches different material, which is what "change things up"
+     * needs to mean. Kept small (see REMIX_OFFSET_STEP) so remixes don't drift into obscurity -
+     * the same relevance-ranking problem documented on MAX_SEARCH_OFFSET applies here.
+     */
+    suspend fun buildAndPublishMixForGenre(genre: String, variation: Int = 0): Result<String> {
+        val remixOffset = (variation * REMIX_OFFSET_STEP) % (MAX_SEARCH_OFFSET + REMIX_OFFSET_STEP)
+        if (variation > 0) Log.d(TAG, "Remix #$variation for '$genre' (search offset $remixOffset)")
         val playlistId = ensurePlaylistExists().getOrElse { return Result.failure(it) }
         val genreLower = genre.lowercase()
 
@@ -91,6 +123,11 @@ class HourlyMixEngine(
         // Explicit like/dislike feedback outranks every inferred signal below: the user pressed a
         // button, which is far less ambiguous than "played this a lot" (which can just mean it
         // was on a playlist they left running).
+        // Genre-specific anchor artists the user named for this genre (Settings > Favourite
+        // artists per genre). Primary steering signal for what this hour should sound like.
+        val anchors = settings.snapshotGenreAnchors().artistsFor(genre)
+        if (anchors.isNotEmpty()) Log.d(TAG, "Anchors for '$genre': ${anchors.joinToString(", ")}")
+
         val feedback = settings.snapshotTrackFeedback()
         val blockedArtists = feedback.blockedArtists()
         val dislikedUris = feedback.dislikedUris
@@ -142,31 +179,65 @@ class HourlyMixEngine(
         for (artist in likedFirst) {
             if (artist.name.lowercase() in blockedArtists) continue
             if (deepTier.size >= quota(SHARE_DEEP_CUTS)) break
-            deepTier += webApi.searchTracksByArtist(artist.name, limit = 5)
+            deepTier += webApi.searchTracksByArtist(artist.name, limit = 5, offset = remixOffset)
                 .getOrDefault(emptyList()).filter(::allowed).map { it.uri }
         }
         Log.d(TAG, "Tier DEEP: ${deepTier.size}")
 
+        // --- Tier 3b: a bounded slice of the anchor artists themselves, so the vibe the user
+        // described is audibly present without dominating (see SHARE_ANCHORS).
+        val anchorTier = mutableListOf<String>()
+        for (name in anchors.shuffled()) {
+            if (anchorTier.size >= quota(SHARE_ANCHORS)) break
+            if (name.lowercase() in blockedArtists) continue
+            anchorTier += webApi.searchTracksByArtist(name, limit = 3, offset = remixOffset)
+                .getOrDefault(emptyList()).filter(::allowed).map { it.uri }
+        }
+        Log.d(TAG, "Tier ANCHORS: ${anchorTier.size}")
+
         // --- Tier 4: discovery via Gemini-suggested adjacent artists
         // Seed discovery with explicitly-liked artists first: "find me more like the things I
         // gave a thumbs-up" is a better prompt than "more like whatever I happened to play".
-        val discoverySeeds = (feedback.favouriteArtists() +
+        // Seed order matters - it's the priority the similarity model sees. Anchors first
+        // (explicitly chosen FOR this genre), then thumbs-up artists, then inferred top artists.
+        // This is where anchors do most of their work: they define the neighbourhood the mix
+        // explores, which is how the playlist stays varied while still sounding like the user's
+        // taste rather than being limited to the anchors themselves.
+        val discoverySeeds = (anchors +
+            feedback.favouriteArtists() +
             genreArtists.map { it.name }.ifEmpty { allTopArtists.map { it.name } }).distinct()
         val discoveryTier = suggestedArtistTracks(
             seeds = discoverySeeds,
             genre = genre,
-            limit = quota(SHARE_DISCOVERY),
+            // With anchors present the similarity expansion is far better targeted, so it earns
+            // a larger share of the hour than it would from inferred seeds alone.
+            limit = if (anchors.isNotEmpty()) quota(SHARE_DISCOVERY * 1.5) else quota(SHARE_DISCOVERY),
             excludeUris = dislikedUris,
             excludeArtists = blockedArtists
         )
         Log.d(TAG, "Tier DISCOVERY: ${discoveryTier.size}")
 
-        val curated = (savedTier + topTier + deepTier.shuffled() + discoveryTier).distinct().toMutableList()
+        val curated = (savedTier + topTier + anchorTier.shuffled() + deepTier.shuffled() + discoveryTier)
+            .distinct().toMutableList()
 
         // --- Tier 5: genre-search fill, only if the personal tiers came up short
         if (curated.size < TARGET_TRACK_COUNT) {
-            var offset = 0
-            while (curated.size < TARGET_TRACK_COUNT) {
+            // Tier 5a: mainstream artists named by Gemini, as a stand-in for the popularity
+            // filter Spotify no longer offers (see suggestMainstreamArtists).
+            geminiClient?.suggestMainstreamArtists(genre)?.getOrNull()?.let { mainstream ->
+                Log.d(TAG, "Mainstream fill artists: ${mainstream.joinToString(", ")}")
+                for (name in mainstream) {
+                    if (curated.size >= TARGET_TRACK_COUNT) break
+                    if (name.lowercase() in blockedArtists) continue
+                    curated += webApi.searchTracksByArtist(name, limit = 3)
+                        .getOrDefault(emptyList()).filter(::allowed).map { it.uri }
+                        .filterNot { it in curated }
+                }
+            }
+
+            // Tier 5b: plain genre search, deliberately shallow (see MAX_SEARCH_OFFSET).
+            var offset = remixOffset
+            while (curated.size < TARGET_TRACK_COUNT && offset <= MAX_SEARCH_OFFSET + remixOffset) {
                 val page = webApi.searchTracksByGenre(genre, limit = SEARCH_PAGE_SIZE, offset = offset)
                     .getOrDefault(emptyList())
                 if (page.isEmpty()) break
@@ -223,6 +294,9 @@ class HourlyMixEngine(
             if (uris.size >= limit) break
             // 2 tracks per suggested artist keeps discovery varied across several new artists
             // rather than dropping a block of one unfamiliar act into the hour.
+            // limit=2 and no offset: the first search results for an artist name are their
+            // best-known tracks, so this stays recognisable rather than pulling deep cuts from
+            // an artist the listener has never heard of.
             uris += webApi.searchTracksByArtist(name, limit = 2)
                 .getOrDefault(emptyList())
                 .filter { it.uri !in excludeUris && it.artistName.lowercase() !in excludeArtists }

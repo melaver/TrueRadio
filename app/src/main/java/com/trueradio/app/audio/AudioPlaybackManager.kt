@@ -8,6 +8,8 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import android.util.Log
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import kotlin.coroutines.resume
@@ -19,6 +21,12 @@ import kotlin.coroutines.resume
  * Spotify's volume is restored the moment playback ends.
  */
 class AudioPlaybackManager(private val context: Context) {
+
+    companion object {
+        private const val TAG = "DJ_FLOW"
+        /** Time allowed for Spotify's volume ramp before the DJ starts speaking. */
+        private const val DUCK_SETTLE_MS = 300L
+    }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var exoPlayer: ExoPlayer? = null
@@ -43,50 +51,88 @@ class AudioPlaybackManager(private val context: Context) {
         val file = File(context.cacheDir, "dj_line_${System.currentTimeMillis()}.wav")
         try {
             file.writeBytes(wavBytes)
-            android.util.Log.d("AudioPlaybackManager", "Playing ${wavBytes.size} bytes of DJ audio")
+            Log.d(TAG, "Step 4b: wrote ${wavBytes.size} bytes to ${file.name}")
             playDuckedLine(file)
         } finally {
             if (file.exists() && !file.delete()) {
-                android.util.Log.w("AudioPlaybackManager", "Could not delete temp audio ${file.name}")
+                Log.w(TAG, "Could not delete temp audio ${file.name}")
             }
         }
     }
 
-    /** Requests ducking focus, plays the DJ line to completion, then abandons focus. */
-    suspend fun playDuckedLine(file: File) = suspendCancellableCoroutine<Unit> { cont ->
+    /**
+     * Requests ducking focus, waits for Spotify to actually duck, plays the DJ line to
+     * completion, then abandons focus so Spotify returns to full volume.
+     *
+     * Ordering is deliberate and was the source of two bugs:
+     *  - The listener is attached BEFORE prepare(). It used to be attached after, which meant an
+     *    immediate failure during prepare() (corrupt/short audio, unsupported format) fired
+     *    onPlayerError with no listener attached - the coroutine never resumed, and Spotify stayed
+     *    ducked until the caller's 90s timeout. That is the "music stays quiet forever" symptom.
+     *  - A short settle delay separates the focus request from playback. Ducking is asynchronous:
+     *    the request only *notifies* Spotify, which then ramps its own volume down. Starting
+     *    instantly meant the DJ's first word landed over full-volume music.
+     */
+    suspend fun playDuckedLine(file: File) {
         val granted = requestDuckingFocus()
-        if (!granted) {
-            // Still attempt playback - better a full-volume DJ line than silence.
+        Log.d(TAG, "Step 5a: audio focus ${if (granted) "GRANTED" else "DENIED (playing anyway)"}")
+        // Let Spotify's volume ramp complete before the first word. Skipped if focus was denied,
+        // since nothing is going to duck in that case.
+        if (granted) delay(DUCK_SETTLE_MS)
+
+        try {
+            awaitPlayback(file)
+        } finally {
+            // Focus is abandoned here, after playback has genuinely finished (or failed, or been
+            // cancelled) - never earlier, so music can't come back up mid-sentence.
+            abandonDuckingFocus()
+            Log.d(TAG, "Step 5c: audio focus released, Spotify restored")
         }
+    }
+
+    private suspend fun awaitPlayback(file: File) = suspendCancellableCoroutine<Unit> { cont ->
+        // Defensive: release any player left over from a cancelled previous segment before
+        // overwriting the field, which would otherwise leak it.
+        exoPlayer?.release()
 
         val player = buildExoPlayer().also { exoPlayer = it }
-        player.setMediaItem(MediaItem.fromUri(file.toURI().toString()))
-        player.prepare()
-        player.playWhenReady = true
 
+        // Attach BEFORE prepare() - see the doc comment above.
         player.addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_ENDED) {
-                    cleanupAfterPlayback(player)
+                    Log.d(TAG, "Step 5b: ExoPlayer STATE_ENDED")
+                    releasePlayer(player)
                     if (cont.isActive) cont.resume(Unit)
                 }
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                cleanupAfterPlayback(player)
+                Log.e(TAG, "Step 5b: ExoPlayer ERROR - aborting segment", error)
+                releasePlayer(player)
                 if (cont.isActive) cont.resume(Unit)
             }
         })
 
+        player.setMediaItem(MediaItem.fromUri(file.toURI().toString()))
+        player.prepare()
+        player.playWhenReady = true
+        Log.d(TAG, "Step 5: ExoPlayer START")
+
         cont.invokeOnCancellation {
-            cleanupAfterPlayback(player)
+            Log.w(TAG, "Step 5b: playback cancelled - releasing player")
+            releasePlayer(player)
         }
     }
 
-    private fun cleanupAfterPlayback(player: ExoPlayer) {
+    /**
+     * Releases the player only. Focus is deliberately NOT abandoned here - that happens in
+     * playDuckedLine's finally block, so there is exactly one place that restores Spotify's
+     * volume and it can't run while audio is still playing.
+     */
+    private fun releasePlayer(player: ExoPlayer) {
         player.release()
         if (exoPlayer === player) exoPlayer = null
-        abandonDuckingFocus()
     }
 
     private fun requestDuckingFocus(): Boolean {

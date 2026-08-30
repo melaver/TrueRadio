@@ -1,5 +1,6 @@
 package com.trueradio.app.service
 
+import com.trueradio.app.DaySegment
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,11 +29,25 @@ object RadioServiceState {
     private val _nowPlaying = MutableStateFlow<String?>(null)
     val nowPlaying: StateFlow<String?> = _nowPlaying.asStateFlow()
 
+    /** Current daypart, e.g. MORNING - drives the greeting on the dashboard. */
+    private val _daySegment = MutableStateFlow(DaySegment.forHour(
+        java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+    ))
+    val daySegment: StateFlow<DaySegment> = _daySegment.asStateFlow()
+
+    /** Genre the current hour's mix was built around; null before the first mix is built. */
+    private val _currentGenre = MutableStateFlow<String?>(null)
+    val currentGenre: StateFlow<String?> = _currentGenre.asStateFlow()
+
+    internal fun setDaySegment(segment: DaySegment) { _daySegment.value = segment }
+    internal fun setCurrentGenre(genre: String?) { _currentGenre.value = genre }
+
     internal fun setRunning(running: Boolean) {
         _isRunning.value = running
         if (!running) {
             _status.value = "Idle"
             _nowPlaying.value = null
+            _currentGenre.value = null
         }
     }
 

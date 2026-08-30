@@ -313,6 +313,30 @@ class GeminiClient(
         generateScript(genreChangePrompt(newGenre))
 
     /**
+     * Names well-known, mainstream artists for a genre.
+     *
+     * This exists as a POPULARITY PROXY. Spotify's February 2026 migration stripped the
+     * `popularity` field from track and artist objects, and `/recommendations` (which accepted
+     * min_popularity/target_popularity) was removed in November 2024 - so there is no longer any
+     * API-side way to ask for "well-known artists only". Gemini knows which acts are household
+     * names, and every name it returns is resolved through Spotify search, so a hallucinated
+     * artist simply yields no results and is skipped.
+     */
+    suspend fun suggestMainstreamArtists(genre: String, count: Int = 10): Result<List<String>> {
+        val prompt = """
+            List exactly $count well-known, mainstream, widely-recognised recording artists in the
+            "$genre" genre - the kind of names a general listener would recognise, not obscure or
+            underground acts.
+
+            Hard rules:
+            - Only real, existing recording artists.
+            - Favour commercially successful and widely played artists.
+            - Output ONLY the artist names, one per line. No numbering, no commentary, no blank lines.
+        """.trimIndent()
+        return generateScript(prompt).map { parseArtistList(it, count) }
+    }
+
+    /**
      * Suggests artists the listener is likely to enjoy, given artists they already love.
      *
      * This exists because Spotify has **no similarity endpoint anymore** - both
@@ -347,22 +371,28 @@ class GeminiClient(
         """.trimIndent()
 
         return generateScript(prompt).map { raw ->
-            raw.lines()
-                .map { line ->
-                    // Defensive cleanup: models sometimes ignore "no numbering/bullets" formatting
-                    // instructions, so strip common list prefixes rather than trusting compliance.
-                    line.trim()
-                        .removePrefix("-").removePrefix("*").removePrefix("•")
-                        .replace(Regex("^\\d+[.)]\\s*"), "")
-                        .trim()
-                }
-                .filter { it.isNotBlank() && it.length in 2..60 }
+            parseArtistList(raw, count)
                 // Guard against the model echoing a seed artist back despite being told not to.
                 .filterNot { suggestion -> seedArtists.any { it.equals(suggestion, ignoreCase = true) } }
-                .distinct()
-                .take(count)
         }
     }
+
+    /**
+     * Shared parser for the artist-name list responses. Models sometimes ignore "no
+     * numbering/bullets" instructions, so common list prefixes are stripped rather than trusting
+     * compliance.
+     */
+    private fun parseArtistList(raw: String, count: Int): List<String> =
+        raw.lines()
+            .map { line ->
+                line.trim()
+                    .removePrefix("-").removePrefix("*").removePrefix("•")
+                    .replace(Regex("^\\d+[.)]\\s*"), "")
+                    .trim()
+            }
+            .filter { it.isNotBlank() && it.length in 2..60 }
+            .distinct()
+            .take(count)
 
     // ---------------------------------------------------------------- speech generation
 

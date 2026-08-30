@@ -13,8 +13,10 @@ import com.trueradio.app.DaySegment
 import com.trueradio.app.DjLanguage
 import com.trueradio.app.NewsCategory
 import com.trueradio.app.NewsPreferences
+import com.trueradio.app.GenreAnchors
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
+import com.trueradio.app.ui.components.GenreArtistSeedEditor
 import com.trueradio.app.ui.components.SectionHeader
 import com.trueradio.app.ui.components.SelectableChipGrid
 import com.trueradio.app.ui.components.SingleChoiceChipGrid
@@ -210,6 +212,7 @@ private fun PreferencesStep(settings: SecureSettings) {
     val djLanguage by settings.djLanguage.collectAsState(initial = DjLanguage.HEBREW)
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
+    val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
 
     var activeSegment by rememberSaveable { mutableStateOf(DaySegment.MORNING) }
 
@@ -242,6 +245,30 @@ private fun PreferencesStep(settings: SecureSettings) {
             },
             label = { it }
         )
+
+
+        // One editor per genre selected for this daypart, so seeds are captured right where the
+        // genre is chosen rather than in a separate disconnected screen.
+        val selectedForSegment = segmentGenres.genresFor(activeSegment)
+        if (selectedForSegment.isNotEmpty()) {
+            SectionHeader(
+                "Favourite artists per genre",
+                "Optional but recommended: naming a few artists per genre sharply improves how " +
+                    "well the mix matches your taste."
+            )
+            selectedForSegment.forEach { genre ->
+                GenreArtistSeedEditor(
+                    genre = genre,
+                    artists = genreAnchors.artistsFor(genre),
+                    onAdd = { artist ->
+                        scope.launch { settings.saveGenreAnchors(genreAnchors.withArtist(genre, artist)) }
+                    },
+                    onRemove = { artist ->
+                        scope.launch { settings.saveGenreAnchors(genreAnchors.withoutArtist(genre, artist)) }
+                    }
+                )
+            }
+        }
 
         SectionHeader("News topics", "Headlines matching these get priority in the hourly flash.")
         SelectableChipGrid(
