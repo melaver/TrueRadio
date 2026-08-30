@@ -330,7 +330,8 @@ data class GenreAnchors(
         val current = byGenre[key].orEmpty()
         // Case-insensitive dedupe so "Radiohead" and "radiohead" don't both get stored.
         if (current.any { it.equals(trimmed, ignoreCase = true) }) return this
-        return copy(byGenre = byGenre + (key to (current + trimmed).take(MAX_PER_GENRE)))
+        val cap = if (key == GLOBAL_KEY) MAX_GLOBAL else MAX_PER_GENRE
+        return copy(byGenre = byGenre + (key to (current + trimmed).take(cap)))
     }
 
     fun withoutArtist(genre: String, artist: String): GenreAnchors {
@@ -347,8 +348,21 @@ data class GenreAnchors(
                 artists.joinToString(",") { it.replace(",", " ").replace("|", " ").trim() }
         }
 
+    /**
+     * Artists the user likes regardless of genre, stored under this reserved key. Per-genre lists
+     * proved tedious to fill in - most people think in terms of "artists I like", not "my jazz
+     * artists" - so this is the primary input, with per-genre lists kept as an optional refinement.
+     */
+    fun globalArtists(): List<String> = byGenre[GLOBAL_KEY].orEmpty()
+
+    /** Global artists plus any specific to [genre], deduplicated. */
+    fun seedsFor(genre: String): List<String> =
+        (artistsFor(genre) + globalArtists()).distinctBy { it.lowercase() }
+
     companion object {
+        const val GLOBAL_KEY = "__global__"
         const val MAX_PER_GENRE = 5
+        const val MAX_GLOBAL = 20
         const val RECOMMENDED_MIN = 3
 
         fun deserialize(blob: String): GenreAnchors {
@@ -373,14 +387,38 @@ data class GenreAnchors(
  * filtered - they're already your taste, and there'd be no reliable way to detect their language
  * anyway. Treat it as a strong bias, not a guarantee.
  */
-enum class SongLanguage(val displayName: String, val promptName: String?) {
-    ANY("Any language", null),
-    HEBREW("עברית / Hebrew", "Hebrew"),
+enum class SongLanguage(val displayName: String, val promptName: String) {
+    HEBREW("עברית", "Hebrew"),
     ENGLISH("English", "English"),
-    SPANISH("Español / Spanish", "Spanish"),
-    FRENCH("Français / French", "French"),
-    ARABIC("العربية / Arabic", "Arabic"),
-    RUSSIAN("Русский / Russian", "Russian")
+    SPANISH("Español", "Spanish"),
+    FRENCH("Français", "French"),
+    ARABIC("العربية", "Arabic"),
+    RUSSIAN("Русский", "Russian"),
+    PORTUGUESE("Português", "Portuguese"),
+    ITALIAN("Italiano", "Italian"),
+    GERMAN("Deutsch", "German"),
+    KOREAN("한국어", "Korean"),
+    JAPANESE("日本語", "Japanese");
+
+    companion object {
+        /**
+         * Renders a selection for use in a prompt. An empty set means "no preference" and yields
+         * null, which callers treat as an unconstrained request - deliberately the same as
+         * selecting every language, so the user can't accidentally construct an impossible
+         * constraint by deselecting everything.
+         */
+        fun promptClause(selected: Set<SongLanguage>): String? = when {
+            selected.isEmpty() -> null
+            selected.size == entries.size -> null
+            selected.size == 1 -> selected.first().promptName
+            else -> selected.joinToString(" or ") { it.promptName }
+        }
+
+        fun fromNames(csv: String): Set<SongLanguage> =
+            csv.split(",").mapNotNull { name ->
+                entries.firstOrNull { it.name == name.trim() }
+            }.toSet()
+    }
 }
 
 /** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */

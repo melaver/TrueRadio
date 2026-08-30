@@ -72,8 +72,9 @@ class SecureSettings(private val context: Context) {
     val genreAnchors: Flow<GenreAnchors> = context.dataStore.data.map {
         GenreAnchors.deserialize(it[Keys.GENRE_ANCHORS] ?: "")
     }
-    val songLanguage: Flow<SongLanguage> = context.dataStore.data.map { prefs ->
-        SongLanguage.entries.firstOrNull { it.name == prefs[Keys.SONG_LANGUAGE] } ?: SongLanguage.ANY
+    /** Empty set = no language preference; see SongLanguage.promptClause. */
+    val songLanguages: Flow<Set<SongLanguage>> = context.dataStore.data.map { prefs ->
+        SongLanguage.fromNames(prefs[Keys.SONG_LANGUAGE] ?: "")
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -146,8 +147,10 @@ class SecureSettings(private val context: Context) {
         context.dataStore.edit { prefs -> prefs[Keys.GENRE_ANCHORS] = anchors.serialize() }
     }
 
-    suspend fun saveSongLanguage(language: SongLanguage) {
-        context.dataStore.edit { prefs -> prefs[Keys.SONG_LANGUAGE] = language.name }
+    suspend fun saveSongLanguages(languages: Set<SongLanguage>) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.SONG_LANGUAGE] = languages.joinToString(",") { it.name }
+        }
     }
 
     suspend fun setOnboardingComplete(complete: Boolean) {
@@ -168,5 +171,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotSegmentGenres(): SegmentGenres = segmentGenres.first()
     suspend fun snapshotTrackFeedback(): TrackFeedback = trackFeedback.first()
     suspend fun snapshotGenreAnchors(): GenreAnchors = genreAnchors.first()
-    suspend fun snapshotSongLanguage(): SongLanguage = songLanguage.first()
+    suspend fun snapshotSongLanguages(): Set<SongLanguage> = songLanguages.first()
 }

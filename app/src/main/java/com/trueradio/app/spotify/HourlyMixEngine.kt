@@ -2,6 +2,7 @@ package com.trueradio.app.spotify
 
 import android.util.Log
 import com.trueradio.app.SecureSettings
+import com.trueradio.app.SongLanguage
 import com.trueradio.app.ai.GeminiClient
 
 /**
@@ -136,10 +137,11 @@ class HourlyMixEngine(
         // artists per genre). Primary steering signal for what this hour should sound like.
         // Language preference steers artist selection only - see SongLanguage for why it can't
         // be a hard filter (Spotify exposes no language field on tracks or artists).
-        val songLanguage = settings.snapshotSongLanguage().promptName
+        val songLanguage = SongLanguage.promptClause(settings.snapshotSongLanguages())
         if (songLanguage != null) Log.d(TAG, "Song language preference: $songLanguage")
 
-        val anchors = settings.snapshotGenreAnchors().artistsFor(genre)
+        // Global liked artists + any named specifically for this genre.
+        val anchors = settings.snapshotGenreAnchors().seedsFor(genre)
         if (anchors.isNotEmpty()) Log.d(TAG, "Anchors for '$genre': ${anchors.joinToString(", ")}")
 
         val feedback = settings.snapshotTrackFeedback()

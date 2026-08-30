@@ -80,6 +80,8 @@ class RadioForegroundService : LifecycleService() {
         private const val SCRIPT_BATCH_SIZE = 5
         /** Refill the batch when fewer than this many cached scripts remain. */
         private const val SCRIPT_REFILL_THRESHOLD = 2
+        /** Minimum gap between automatic playlist rebuilds; user-initiated remixes ignore this. */
+        private const val MIN_MIX_INTERVAL_MS = 10 * 60 * 1000L
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
         private const val TAG = "RadioDJService"
         /**
@@ -156,6 +158,24 @@ class RadioForegroundService : LifecycleService() {
     private var playbackMsSinceNews = 0L
     private var lastGenreSwitchHour = -1
 
+    /**
+     * Guards against re-initialising an already-running session. onStartCommand's else-branch
+     * runs for ANY unrecognised intent - including the null intent Android redelivers under
+     * START_STICKY after the service is killed and restarted. Without this guard each redelivery
+     * built a second SpotifyManager, added a SECOND playback subscription (so every trigger fired
+     * twice, then three times...), and rebuilt the playlist. That is why a new playlist appeared
+     * roughly every song, and a large part of the Gemini 429s.
+     */
+    private var isInitialized = false
+    private var playbackJob: Job? = null
+
+    /**
+     * When the current mix was built. Rebuilding is expensive (several Gemini + Spotify calls),
+     * so a cooldown makes accidental repeat triggers cheap to absorb rather than catastrophic.
+     * Explicit user remixes bypass it.
+     */
+    private var lastMixBuiltAtMs = 0L
+
     // Guards the DJ's "one voice at a time" invariant. This used to be a plain `isSpeaking`
     // boolean set true only deep inside speakLine() - but news and genre-switch both fire in the
     // *same* 0-3-minutes-past-the-hour window, and both are checked back-to-back synchronously
@@ -220,6 +240,12 @@ class RadioForegroundService : LifecycleService() {
                 return START_STICKY
             }
             else -> {
+                if (isInitialized) {
+                    // Almost always a START_STICKY redelivery; re-initialising would duplicate
+                    // the Spotify connection and rebuild the playlist for no reason.
+                    Log.d(TAG, "Already initialized - ignoring duplicate start command")
+                    return START_STICKY
+                }
                 val clientId = intent?.getStringExtra(EXTRA_SPOTIFY_CLIENT_ID)
                 lifecycleScope.launch { initializeAndConnect(clientId) }
             }
@@ -241,6 +267,7 @@ class RadioForegroundService : LifecycleService() {
             Log.e(TAG, "Gemini API key is blank - DJ speech will be unavailable")
             updateStatus("Missing Gemini API key - the DJ can't speak. Add it in Settings.")
         }
+        isInitialized = true
         geminiClient = GeminiClient(geminiKey, djLanguage)
         localTts = LocalTtsFallback(applicationContext)
         Log.d(TAG, "Initialized DJ (language=$djLanguage, geminiKeyPresent=${geminiKey.isNotBlank()})")
@@ -275,7 +302,10 @@ class RadioForegroundService : LifecycleService() {
     }
 
     private fun observePlayback(manager: SpotifyManager) {
-        manager.observePlayerState()
+        // Cancel any previous subscription before starting a new one - two live subscriptions
+        // would deliver every PlayerState twice and double every downstream trigger.
+        playbackJob?.cancel()
+        playbackJob = manager.observePlayerState()
             .onEach { track -> onPlayerState(track) }
             .catch { e -> updateStatus("Playback stream error: ${e.message}") }
             .launchIn(lifecycleScope)
@@ -545,6 +575,7 @@ class RadioForegroundService : LifecycleService() {
                         updateStatus("Remix failed: ${it.message}")
                         return@launch
                     }
+                lastMixBuiltAtMs = System.currentTimeMillis()
                 RadioServiceState.setCurrentGenre(genre)
                 // New playlist means the cached scripts describe tracks that are no longer queued.
                 scriptCache.clear()
@@ -608,6 +639,11 @@ class RadioForegroundService : LifecycleService() {
      * very first playback after connecting, since there's no need to narrate the opening pick.
      */
     private suspend fun runGenreSwitch(hour: Int, announce: Boolean) {
+        val sinceLastBuild = System.currentTimeMillis() - lastMixBuiltAtMs
+        if (lastMixBuiltAtMs != 0L && sinceLastBuild < MIN_MIX_INTERVAL_MS) {
+            Log.w(TAG, "Skipping mix rebuild - last one was ${sinceLastBuild / 1000}s ago (cooldown ${MIN_MIX_INTERVAL_MS / 1000}s)")
+            return
+        }
         val engine = hourlyMixEngine ?: return
         val manager = spotifyManager ?: return
         val rotation = settings.snapshotGenreRotation()
@@ -653,6 +689,7 @@ class RadioForegroundService : LifecycleService() {
             }
         }
 
+        lastMixBuiltAtMs = System.currentTimeMillis()
         manager.playUri(playlistUri)
         maybeRefillScriptBatch() // prime the first batch against the new playlist
         updateStatus("On air - $genre")
@@ -847,6 +884,8 @@ class RadioForegroundService : LifecycleService() {
 
     override fun onDestroy() {
         spotifyManager?.disconnect()
+        isInitialized = false
+        playbackJob?.cancel()
         prefetchJob?.cancel()
         batchJob?.cancel()
         RadioServiceState.setRunning(false)

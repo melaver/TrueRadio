@@ -17,7 +17,7 @@ import com.trueradio.app.GenreAnchors
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
 import com.trueradio.app.SongLanguage
-import com.trueradio.app.ui.components.GenreArtistSeedEditor
+import com.trueradio.app.ui.components.LikedArtistsEditor
 import com.trueradio.app.ui.components.SectionHeader
 import com.trueradio.app.ui.components.SelectableChipGrid
 import com.trueradio.app.ui.components.SingleChoiceChipGrid
@@ -214,7 +214,7 @@ private fun PreferencesStep(settings: SecureSettings) {
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
-    val songLanguage by settings.songLanguage.collectAsState(initial = SongLanguage.ANY)
+    val songLanguages by settings.songLanguages.collectAsState(initial = emptySet())
 
     var activeSegment by rememberSaveable { mutableStateOf(DaySegment.MORNING) }
 
@@ -229,11 +229,17 @@ private fun PreferencesStep(settings: SecureSettings) {
             label = { it.displayName }
         )
 
-        SectionHeader("Song language", "Optional. Biases which artists get picked; not an exact filter.")
-        SingleChoiceChipGrid(
+        SectionHeader(
+            "Song languages",
+            "Optional, pick any number. Biases which artists get picked; not an exact filter."
+        )
+        SelectableChipGrid(
             options = SongLanguage.entries.toList(),
-            selected = songLanguage,
-            onSelect = { scope.launch { settings.saveSongLanguage(it) } },
+            selected = songLanguages,
+            onToggle = { lang ->
+                val updated = if (lang in songLanguages) songLanguages - lang else songLanguages + lang
+                scope.launch { settings.saveSongLanguages(updated) }
+            },
             label = { it.displayName }
         )
 
@@ -256,31 +262,20 @@ private fun PreferencesStep(settings: SecureSettings) {
             label = { it }
         )
 
-
-        // One editor per genre selected for this daypart, so seeds are captured right where the
-        // genre is chosen rather than in a separate disconnected screen.
-        val selectedForSegment = segmentGenres.genresFor(activeSegment)
-        if (selectedForSegment.isNotEmpty()) {
-            SectionHeader(
-                "Favourite artists per genre",
-                "Optional but recommended: naming a few artists per genre sharply improves how " +
-                    "well the mix matches your taste."
-            )
-            selectedForSegment.forEach { genre ->
-                GenreArtistSeedEditor(
-                    genre = genre,
-                    artists = genreAnchors.artistsFor(genre),
-                    onArtistsChanged = { list ->
-                        scope.launch {
-                            var updated = genreAnchors.copy(
-                                byGenre = genreAnchors.byGenre + (genre.lowercase() to list)
-                            )
-                            settings.saveGenreAnchors(updated)
-                        }
-                    }
-                )
+        SectionHeader(
+            "Your favourite artists",
+            "The strongest signal for matching your taste. These steer every mix without limiting it to just them."
+        )
+        LikedArtistsEditor(
+            artists = genreAnchors.globalArtists(),
+            maxArtists = GenreAnchors.MAX_GLOBAL,
+            onAdd = { artist ->
+                scope.launch { settings.saveGenreAnchors(genreAnchors.withArtist(GenreAnchors.GLOBAL_KEY, artist)) }
+            },
+            onRemove = { artist ->
+                scope.launch { settings.saveGenreAnchors(genreAnchors.withoutArtist(GenreAnchors.GLOBAL_KEY, artist)) }
             }
-        }
+        )
 
         SectionHeader("News topics", "Headlines matching these get priority in the hourly flash.")
         SelectableChipGrid(
