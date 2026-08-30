@@ -42,6 +42,11 @@ object RadioServiceState {
     internal fun setDaySegment(segment: DaySegment) { _daySegment.value = segment }
     internal fun setCurrentGenre(genre: String?) { _currentGenre.value = genre }
 
+    /** True while Gemini calls are locally suppressed after a 429; UI explains the degraded mode. */
+    private val _isRateLimited = MutableStateFlow(false)
+    val isRateLimited: StateFlow<Boolean> = _isRateLimited.asStateFlow()
+    internal fun setRateLimited(limited: Boolean) { _isRateLimited.value = limited }
+
     internal fun setRunning(running: Boolean) {
         _isRunning.value = running
         if (!running) {

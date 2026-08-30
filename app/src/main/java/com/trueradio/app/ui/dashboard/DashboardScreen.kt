@@ -64,6 +64,7 @@ fun DashboardScreen(
     val nowPlaying by RadioServiceState.nowPlaying.collectAsState()
     val daySegment by RadioServiceState.daySegment.collectAsState()
     val currentGenre by RadioServiceState.currentGenre.collectAsState()
+    val isRateLimited by RadioServiceState.isRateLimited.collectAsState()
 
     val spotifyClientId by settings.spotifyClientId.collectAsState(initial = "")
     val geminiKey by settings.geminiApiKey.collectAsState(initial = "")
@@ -155,6 +156,14 @@ fun DashboardScreen(
                     icon = { Icon(Icons.Default.Refresh, null, tint = RadioPalette.Champagne) },
                     label = "REMIX",
                     onClick = onRemix
+                )
+            }
+
+            if (isRateLimited) {
+                Spacer(Modifier.height(12.dp))
+                AssistChip(
+                    onClick = onOpenSettings,
+                    label = { Text("Gemini rate limited - DJ using offline voice") }
                 )
             }
 
@@ -310,6 +319,9 @@ private fun DialWindow(
                 strokeWidth = 4f
             )
         }
+
+        Spacer(Modifier.height(4.dp))
+        DialVisualizer(isActive = isRunning)
 
         Spacer(Modifier.height(6.dp))
         Text(

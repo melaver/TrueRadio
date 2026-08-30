@@ -377,6 +377,7 @@ class RadioForegroundService : LifecycleService() {
                 delay(PLAYBACK_TICK_MS)
                 if (lastKnownIsPaused) continue // only count time the music is actually playing
 
+                RadioServiceState.setRateLimited(GeminiClient.isRateLimited())
                 playbackMsSinceNews += PLAYBACK_TICK_MS
                 if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
                     maybeTriggerNewsFlash()
@@ -716,6 +717,16 @@ class RadioForegroundService : LifecycleService() {
         updateStatus("On air - $genre")
     }
 
+    /**
+     * Simple templated line used when Gemini is unavailable (rate limited or offline). It's not
+     * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
+     * rate limit meant the segment was dropped entirely and the radio just went quiet.
+     */
+    private fun fallbackTriviaLine(track: TrackInfo): String = when (djLanguage) {
+        DjLanguage.HEBREW -> "זה היה ${track.artist}, עם ${track.title}. ממשיכים."
+        DjLanguage.ENGLISH -> "That was ${track.artist}, with ${track.title}. Let's keep it going."
+    }
+
     private suspend fun runTrackTrivia(track: TrackInfo) {
         // Fast path: audio prepared at the start of this track is ready to play immediately.
         val prepared = preparedAudio?.takeIf { preparedTrackUri == track.uri }
@@ -734,8 +745,11 @@ class RadioForegroundService : LifecycleService() {
         // track title; here we pass null and let the DJ speak generically about "the next song".
         val scriptResult = gemini.generateTrackTransition(track.artist, track.title, nextTitle = null)
         val script = scriptResult.getOrElse {
-            Log.e(DJ_TAG, "Step 2: SCRIPT GENERATION FAILED - ${it.message}; segment aborted, music unaffected")
-            updateStatus("Trivia generation failed: ${it.message}")
+            Log.w(DJ_TAG, "Step 2: script generation failed (${it.message}) - using templated line via on-device voice")
+            updateStatus("DJ running in offline mode")
+            // Speak SOMETHING rather than dropping the segment. speakLine will find Gemini TTS
+            // unavailable too and route this straight to the on-device engine.
+            speakLine(fallbackTriviaLine(track), label = "Trivia (fallback)")
             return
         }
         speakLine(script, label = "Trivia")
