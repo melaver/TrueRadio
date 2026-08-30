@@ -4,6 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.trueradio.app.DjLanguage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -15,6 +16,7 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
  * Owns both halves of the DJ's voice:
@@ -66,6 +68,16 @@ class GeminiClient(
 
         private const val ENDPOINT_TEMPLATE =
             "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+
+        /**
+         * Transient-failure retry policy. Gemini returns 503 (UNAVAILABLE / "model overloaded")
+         * fairly regularly on free-tier and preview models at busy times, and 429 when rate
+         * limited - neither means anything is misconfigured, and both usually succeed moments
+         * later. Without retries a single blip silently costs the listener a whole DJ segment.
+         */
+        private const val MAX_ATTEMPTS = 3
+        private const val INITIAL_BACKOFF_MS = 1_000L
+        private val RETRYABLE_CODES = setOf(429, 500, 502, 503, 504)
 
         // Gemini TTS output format, fixed by the API contract - used to build the WAV header.
         private const val TTS_SAMPLE_RATE = 24_000
@@ -196,10 +208,49 @@ class GeminiClient(
         """.trimIndent()
     }
 
+    // ---------------------------------------------------------------- request plumbing
+
+    /**
+     * Executes [block] with exponential backoff on transient failures. Retries only on the codes
+     * in [RETRYABLE_CODES] plus raw network errors - a 400 (bad request) or 404 (model retired)
+     * would fail identically every time, so retrying those just wastes the listener's time and
+     * delays the fallback.
+     *
+     * Backoff includes jitter so that if several DJ segments fail at once they don't all retry in
+     * lockstep and hit the overloaded backend at the same instant.
+     */
+    private suspend fun <T> withRetries(label: String, block: suspend () -> Result<T>): Result<T> {
+        var lastFailure: Throwable? = null
+        repeat(MAX_ATTEMPTS) { attempt ->
+            val result = block()
+            if (result.isSuccess) return result
+
+            val error = result.exceptionOrNull()
+            lastFailure = error
+            val retryable = (error as? RetryableHttpException) != null
+            if (!retryable || attempt == MAX_ATTEMPTS - 1) {
+                if (!retryable) Log.e(TAG, "[$label] non-retryable failure; giving up", error)
+                else Log.e(TAG, "[$label] still failing after $MAX_ATTEMPTS attempts", error)
+                return Result.failure(error ?: IOException("$label failed"))
+            }
+
+            val backoff = INITIAL_BACKOFF_MS * (1L shl attempt) + Random.nextLong(250)
+            Log.w(TAG, "[$label] transient failure (${error?.message}); retrying in ${backoff}ms")
+            delay(backoff)
+        }
+        return Result.failure(lastFailure ?: IOException("$label failed"))
+    }
+
+    /** Marker so [withRetries] can distinguish "try again" from "this will never work". */
+    private class RetryableHttpException(message: String) : IOException(message)
+
     // ---------------------------------------------------------------- text generation
 
     /** Generates a DJ script. Returns failure rather than throwing so callers can fall back. */
-    suspend fun generateScript(prompt: String): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun generateScript(prompt: String): Result<String> =
+        withRetries("script") { generateScriptOnce(prompt) }
+
+    private suspend fun generateScriptOnce(prompt: String): Result<String> = withContext(Dispatchers.IO) {
         try {
             val payload = JSONObject().apply {
                 put(
@@ -224,7 +275,10 @@ class GeminiClient(
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     Log.e(TAG, "Script generation failed: HTTP ${response.code} - ${body.take(400)}")
-                    return@withContext Result.failure(IOException("Gemini text error ${response.code}"))
+                    val msg = "Gemini text error ${response.code}"
+                    return@withContext Result.failure(
+                        if (response.code in RETRYABLE_CODES) RetryableHttpException(msg) else IOException(msg)
+                    )
                 }
                 val text = JSONObject(body)
                     .optJSONArray("candidates")?.optJSONObject(0)
@@ -239,6 +293,10 @@ class GeminiClient(
                 Log.d(TAG, "Script generated (${text.length} chars)")
                 Result.success(text.trim())
             }
+        } catch (e: java.io.IOException) {
+            // Raw network failures (timeout, DNS, connection reset) are worth retrying too.
+            Log.e(TAG, "Script generation network error", e)
+            Result.failure(RetryableHttpException(e.message ?: "network error"))
         } catch (e: Exception) {
             Log.e(TAG, "Script generation threw", e)
             Result.failure(e)
@@ -313,7 +371,10 @@ class GeminiClient(
      * (PCM already wrapped in a RIFF header - see the class doc). Returns failure on any error so
      * the caller can fall back to on-device TTS rather than leaving music ducked forever.
      */
-    suspend fun synthesizeSpeech(text: String): Result<ByteArray> = withContext(Dispatchers.IO) {
+    suspend fun synthesizeSpeech(text: String): Result<ByteArray> =
+        withRetries("tts") { synthesizeSpeechOnce(text) }
+
+    private suspend fun synthesizeSpeechOnce(text: String): Result<ByteArray> = withContext(Dispatchers.IO) {
         try {
             val payload = JSONObject().apply {
                 put(
@@ -344,7 +405,10 @@ class GeminiClient(
                     // A 404 here while text still works almost certainly means TTS_MODEL has been
                     // retired - see the constant's comment.
                     Log.e(TAG, "TTS failed: HTTP ${response.code} - ${body.take(400)}")
-                    return@withContext Result.failure(IOException("Gemini TTS error ${response.code}"))
+                    val msg = "Gemini TTS error ${response.code}"
+                    return@withContext Result.failure(
+                        if (response.code in RETRYABLE_CODES) RetryableHttpException(msg) else IOException(msg)
+                    )
                 }
                 val base64Audio = JSONObject(body)
                     .optJSONArray("candidates")?.optJSONObject(0)
@@ -365,6 +429,9 @@ class GeminiClient(
                 Log.d(TAG, "TTS produced ${pcm.size} PCM bytes, wrapping as WAV")
                 Result.success(pcmToWav(pcm))
             }
+        } catch (e: java.io.IOException) {
+            Log.e(TAG, "TTS network error", e)
+            Result.failure(RetryableHttpException(e.message ?: "network error"))
         } catch (e: Exception) {
             Log.e(TAG, "TTS threw", e)
             Result.failure(e)

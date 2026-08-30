@@ -69,7 +69,9 @@ class MainActivity : ComponentActivity() {
                         onConnectSpotifyWeb = { clientId -> beginSpotifyWebAuth(clientId) },
                         onDisconnectSpotifyWeb = { disconnectSpotifyWeb() },
                         onStartRadio = { clientId -> startDjService(clientId) },
-                        onStopRadio = { stopDjService() }
+                        onStopRadio = { stopDjService() },
+                        onLike = { sendServiceAction(RadioForegroundService.ACTION_LIKE) },
+                        onDislike = { sendServiceAction(RadioForegroundService.ACTION_DISLIKE) }
                     )
                 }
             }
@@ -183,6 +185,15 @@ class MainActivity : ComponentActivity() {
         } else {
             startService(intent)
         }
+    }
+
+    /** Forwards a like/dislike to the running service; ignored if the radio isn't on. */
+    private fun sendServiceAction(action: String) {
+        if (!RadioServiceState.isRunning.value) {
+            Log.d(TAG, "Ignoring $action - service isn't running")
+            return
+        }
+        startService(Intent(this, RadioForegroundService::class.java).apply { this.action = action })
     }
 
     private fun stopDjService() {

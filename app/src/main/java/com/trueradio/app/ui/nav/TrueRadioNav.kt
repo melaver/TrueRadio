@@ -36,7 +36,9 @@ fun TrueRadioNavHost(
     onConnectSpotifyWeb: (String) -> Unit,
     onDisconnectSpotifyWeb: () -> Unit,
     onStartRadio: (String) -> Unit,
-    onStopRadio: () -> Unit
+    onStopRadio: () -> Unit,
+    onLike: () -> Unit,
+    onDislike: () -> Unit
 ) {
     // null = still loading; avoids rendering a start destination we might have to change.
     val onboardingComplete by produceState<Boolean?>(initialValue = null) {
@@ -78,6 +80,8 @@ fun TrueRadioNavHost(
                 settings = settings,
                 onStartRadio = onStartRadio,
                 onStopRadio = onStopRadio,
+                onLike = onLike,
+                onDislike = onDislike,
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) }
             )
         }

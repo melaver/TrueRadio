@@ -236,6 +236,81 @@ data class SegmentGenres(
     }
 }
 
+/**
+ * One like/dislike judgement. The artist is stored alongside the track URI because feedback is
+ * useful at both levels: skipping one disliked song is track-level, but disliking several tracks
+ * by the same artist is a signal to stop surfacing that artist at all.
+ */
+data class TrackVerdict(val uri: String, val artist: String)
+
+/**
+ * Accumulated like/dislike history, used to bias future mixes.
+ *
+ * Kept as an append-only record rather than a score per track: it's small (a few hundred entries
+ * at most for realistic use), and keeping the raw judgements means the weighting rules can be
+ * changed later without having lost the underlying data.
+ */
+data class TrackFeedback(
+    val liked: List<TrackVerdict> = emptyList(),
+    val disliked: List<TrackVerdict> = emptyList()
+) {
+    val likedUris: Set<String> get() = liked.map { it.uri }.toSet()
+    val dislikedUris: Set<String> get() = disliked.map { it.uri }.toSet()
+
+    /** Artists with at least one like, most-liked first - used as extra seeds for the mix. */
+    fun favouriteArtists(): List<String> =
+        liked.groupingBy { it.artist }.eachCount()
+            .entries.sortedByDescending { it.value }
+            .map { it.key }
+            .filter { it.isNotBlank() }
+
+    /**
+     * Artists disliked [threshold]+ times, excluded from the mix entirely. Requires more than one
+     * dislike so a single skip of one bad song doesn't blacklist an artist you otherwise like.
+     */
+    fun blockedArtists(threshold: Int = 2): Set<String> =
+        disliked.groupingBy { it.artist.lowercase() }.eachCount()
+            .filterValues { it >= threshold }.keys
+
+    fun withLike(verdict: TrackVerdict): TrackFeedback = copy(
+        // A like overrides any previous dislike of the same track, and vice versa, so changing
+        // your mind actually takes effect instead of leaving contradictory entries on both lists.
+        liked = (liked.filterNot { it.uri == verdict.uri } + verdict).takeLast(MAX_ENTRIES),
+        disliked = disliked.filterNot { it.uri == verdict.uri }
+    )
+
+    fun withDislike(verdict: TrackVerdict): TrackFeedback = copy(
+        liked = liked.filterNot { it.uri == verdict.uri },
+        disliked = (disliked.filterNot { it.uri == verdict.uri } + verdict).takeLast(MAX_ENTRIES)
+    )
+
+    fun serialize(): String {
+        fun enc(list: List<TrackVerdict>) = list.joinToString("\n") { v ->
+            v.uri.replace("\u0001", "").replace("\n", "") + "\u0001" +
+                v.artist.replace("\u0001", "").replace("\n", " ")
+        }
+        return enc(liked) + "\u0002" + enc(disliked)
+    }
+
+    companion object {
+        /** Cap so the store can't grow without bound over months of listening. */
+        private const val MAX_ENTRIES = 500
+
+        fun deserialize(blob: String): TrackFeedback {
+            if (blob.isBlank()) return TrackFeedback()
+            val halves = blob.split("\u0002")
+            fun dec(part: String) = part.split("\n").mapNotNull { line ->
+                val parts = line.split("\u0001")
+                if (parts.size != 2 || parts[0].isBlank()) null else TrackVerdict(parts[0], parts[1])
+            }
+            return TrackFeedback(
+                liked = dec(halves.getOrElse(0) { "" }),
+                disliked = dec(halves.getOrElse(1) { "" })
+            )
+        }
+    }
+}
+
 /** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */
 enum class DjLanguage(val displayName: String) {
     HEBREW("עברית"),

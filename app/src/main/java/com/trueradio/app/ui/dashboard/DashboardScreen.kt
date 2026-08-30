@@ -5,6 +5,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.ThumbDown
+import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,6 +26,8 @@ fun DashboardScreen(
     settings: SecureSettings,
     onStartRadio: (String) -> Unit,
     onStopRadio: () -> Unit,
+    onLike: () -> Unit,
+    onDislike: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     // Sourced from the service itself, so it stays accurate across rotation and when the service
@@ -93,6 +97,31 @@ fun DashboardScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
             )
+
+            // Feedback controls only appear while something is actually playing - there's
+            // nothing to rate otherwise, and a dead button invites confusion.
+            if (isRunning && nowPlaying != null) {
+                Spacer(Modifier.height(24.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    FilledTonalButton(onClick = onLike) {
+                        Icon(Icons.Default.ThumbUp, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Like")
+                    }
+                    FilledTonalButton(onClick = onDislike) {
+                        Icon(Icons.Default.ThumbDown, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Skip")
+                    }
+                }
+                Text(
+                    "Likes shape future mixes; skips stop that track coming back.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
 
             // Surface setup gaps here rather than letting the radio start and fail silently later.
             if (spotifyClientId.isBlank() || geminiKey.isBlank()) {

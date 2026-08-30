@@ -12,6 +12,7 @@ import com.trueradio.app.R
 import com.trueradio.app.RadioApplication
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.TrackInfo
+import com.trueradio.app.TrackVerdict
 import android.util.Log
 import com.trueradio.app.DjLanguage
 import com.trueradio.app.ai.GeminiClient
@@ -53,6 +54,8 @@ class RadioForegroundService : LifecycleService() {
         const val ACTION_START = "com.trueradio.app.action.START"
         const val ACTION_STOP = "com.trueradio.app.action.STOP"
         const val ACTION_PLAY_PAUSE = "com.trueradio.app.action.PLAY_PAUSE"
+        const val ACTION_LIKE = "com.trueradio.app.action.LIKE"
+        const val ACTION_DISLIKE = "com.trueradio.app.action.DISLIKE"
         const val EXTRA_SPOTIFY_CLIENT_ID = "extra_spotify_client_id"
         private const val NOTIFICATION_ID = 42
         private const val TRIVIA_TRIGGER_WINDOW_MS = 15_000L
@@ -65,7 +68,12 @@ class RadioForegroundService : LifecycleService() {
         private const val PLAYBACK_TICK_MS = 10_000L
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
         private const val TAG = "RadioDJService"
-        private const val SPEECH_TIMEOUT_MS = 45_000L
+        /**
+         * Must exceed GeminiClient's worst case: 3 attempts x 45s read timeout, plus ~3s of
+         * backoff between them. A tighter bound here would cancel the retry chain mid-backoff,
+         * silently defeating the retries added for Gemini's transient 503s.
+         */
+        private const val SPEECH_TIMEOUT_MS = 150_000L
         private const val PLAYBACK_TIMEOUT_MS = 90_000L
     }
 
@@ -80,6 +88,8 @@ class RadioForegroundService : LifecycleService() {
     private var hourlyMixEngine: HourlyMixEngine? = null
 
     private var lastTrackUri: String? = null
+    // Full current track, needed so like/dislike can record artist as well as URI.
+    private var currentTrack: TrackInfo? = null
     private var hasFiredTriviaForCurrentTrack = false
     // Accumulated milliseconds of actual playback since the last news flash.
     private var playbackMsSinceNews = 0L
@@ -130,6 +140,14 @@ class RadioForegroundService : LifecycleService() {
             }
             ACTION_PLAY_PAUSE -> {
                 togglePlayback()
+                return START_STICKY
+            }
+            ACTION_LIKE -> {
+                recordFeedback(liked = true)
+                return START_STICKY
+            }
+            ACTION_DISLIKE -> {
+                recordFeedback(liked = false)
                 return START_STICKY
             }
             else -> {
@@ -195,6 +213,7 @@ class RadioForegroundService : LifecycleService() {
     }
 
     private fun onPlayerState(track: TrackInfo) {
+        currentTrack = track
         if (track.uri != lastTrackUri) {
             lastTrackUri = track.uri
             hasFiredTriviaForCurrentTrack = false
@@ -408,6 +427,32 @@ class RadioForegroundService : LifecycleService() {
         }
     }
 
+    /**
+     * Records a like/dislike for whatever is playing. A dislike also skips the track: pressing
+     * "dislike" and then continuing to hear the song out would be a strange experience, and the
+     * skip is the immediate feedback that the button did something.
+     */
+    private fun recordFeedback(liked: Boolean) {
+        val track = currentTrack
+        if (track == null || track.uri.isBlank()) {
+            Log.w(TAG, "Feedback ignored - no current track")
+            return
+        }
+        val verdict = TrackVerdict(track.uri, track.artist)
+        lifecycleScope.launch {
+            try {
+                val current = settings.snapshotTrackFeedback()
+                val updated = if (liked) current.withLike(verdict) else current.withDislike(verdict)
+                settings.saveTrackFeedback(updated)
+                Log.d(TAG, "Recorded ${if (liked) "LIKE" else "DISLIKE"} for ${track.artist} - ${track.title}")
+                updateStatus(if (liked) "Liked ${track.title}" else "Disliked ${track.title} - skipping")
+                if (!liked) spotifyManager?.skipNext()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to record feedback", e)
+            }
+        }
+    }
+
     private fun togglePlayback() {
         val manager = spotifyManager ?: return
         // NOTE: SpotifyManager does not currently expose the last-known isPaused flag directly;
@@ -447,6 +492,15 @@ class RadioForegroundService : LifecycleService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val likeIntent = Intent(this, RadioForegroundService::class.java).setAction(ACTION_LIKE)
+        val likePendingIntent = PendingIntent.getService(
+            this, 3, likeIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val dislikeIntent = Intent(this, RadioForegroundService::class.java).setAction(ACTION_DISLIKE)
+        val dislikePendingIntent = PendingIntent.getService(
+            this, 4, dislikeIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         val stopIntent = Intent(this, RadioForegroundService::class.java).setAction(ACTION_STOP)
         val stopPendingIntent = PendingIntent.getService(
             this, 2, stopIntent,
@@ -465,6 +519,8 @@ class RadioForegroundService : LifecycleService() {
                 if (isPaused) "Play" else "Pause",
                 playPausePendingIntent
             )
+            .addAction(android.R.drawable.btn_star_big_on, "Like", likePendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Dislike", dislikePendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()

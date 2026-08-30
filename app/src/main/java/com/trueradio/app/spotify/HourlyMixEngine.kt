@@ -88,6 +88,14 @@ class HourlyMixEngine(
 
         val savedTracks = webApi.getSavedTracks().getOrDefault(emptyList())
 
+        // Explicit like/dislike feedback outranks every inferred signal below: the user pressed a
+        // button, which is far less ambiguous than "played this a lot" (which can just mean it
+        // was on a playlist they left running).
+        val feedback = settings.snapshotTrackFeedback()
+        val blockedArtists = feedback.blockedArtists()
+        val dislikedUris = feedback.dislikedUris
+        Log.d(TAG, "Feedback: ${feedback.liked.size} liked, ${feedback.disliked.size} disliked, ${blockedArtists.size} artists blocked")
+
         if (allTopArtists.isEmpty() && allTopTracks.isEmpty() && savedTracks.isEmpty()) {
             // Everything personal came back empty - almost always an auth problem (or a brand-new
             // account with no history). Surface it rather than silently shipping a generic mix.
@@ -106,29 +114,50 @@ class HourlyMixEngine(
 
         val quota = { share: Double -> (TARGET_TRACK_COUNT * share).toInt().coerceAtLeast(1) }
 
+        /**
+         * Applied to every tier: drops individually disliked tracks and anything by an artist
+         * blocked after repeated dislikes. Filtering centrally here (rather than per tier) means
+         * a disliked track can't sneak back in through the discovery or genre-fill paths.
+         */
+        fun allowed(track: SpotifyTrack): Boolean =
+            track.uri !in dislikedUris && track.artistName.lowercase() !in blockedArtists
+
         // --- Tier 1: saved tracks in this genre
-        val savedTier = savedTracks.filter(::matchesGenre).map { it.uri }.shuffled().take(quota(SHARE_SAVED))
+        val savedTier = savedTracks.filter { matchesGenre(it) && allowed(it) }
+            .map { it.uri }.shuffled().take(quota(SHARE_SAVED))
         Log.d(TAG, "Tier SAVED: ${savedTier.size}")
 
         // --- Tier 2: most-played tracks in this genre
-        val topTier = allTopTracks.filter(::matchesGenre).map { it.uri }
+        val topTier = allTopTracks.filter { matchesGenre(it) && allowed(it) }.map { it.uri }
             .filterNot { it in savedTier }.shuffled().take(quota(SHARE_TOP))
         Log.d(TAG, "Tier TOP: ${topTier.size}")
 
         // --- Tier 3: deeper catalog from artists already established as favourites
         val deepTier = mutableListOf<String>()
-        for (artist in genreArtists.shuffled()) {
+        // Artists the user explicitly liked go first, then the rest of their genre-matching top
+        // artists - so a thumbs-up directly increases how often that artist reappears.
+        val likedFirst = genreArtists.sortedByDescending { a ->
+            if (feedback.favouriteArtists().any { it.equals(a.name, ignoreCase = true) }) 1 else 0
+        }
+        for (artist in likedFirst) {
+            if (artist.name.lowercase() in blockedArtists) continue
             if (deepTier.size >= quota(SHARE_DEEP_CUTS)) break
             deepTier += webApi.searchTracksByArtist(artist.name, limit = 5)
-                .getOrDefault(emptyList()).map { it.uri }
+                .getOrDefault(emptyList()).filter(::allowed).map { it.uri }
         }
         Log.d(TAG, "Tier DEEP: ${deepTier.size}")
 
         // --- Tier 4: discovery via Gemini-suggested adjacent artists
+        // Seed discovery with explicitly-liked artists first: "find me more like the things I
+        // gave a thumbs-up" is a better prompt than "more like whatever I happened to play".
+        val discoverySeeds = (feedback.favouriteArtists() +
+            genreArtists.map { it.name }.ifEmpty { allTopArtists.map { it.name } }).distinct()
         val discoveryTier = suggestedArtistTracks(
-            seeds = genreArtists.map { it.name }.ifEmpty { allTopArtists.map { it.name } },
+            seeds = discoverySeeds,
             genre = genre,
-            limit = quota(SHARE_DISCOVERY)
+            limit = quota(SHARE_DISCOVERY),
+            excludeUris = dislikedUris,
+            excludeArtists = blockedArtists
         )
         Log.d(TAG, "Tier DISCOVERY: ${discoveryTier.size}")
 
@@ -141,7 +170,7 @@ class HourlyMixEngine(
                 val page = webApi.searchTracksByGenre(genre, limit = SEARCH_PAGE_SIZE, offset = offset)
                     .getOrDefault(emptyList())
                 if (page.isEmpty()) break
-                curated += page.map { it.uri }.filterNot { it in curated }
+                curated += page.filter(::allowed).map { it.uri }.filterNot { it in curated }
                 offset += page.size
             }
             Log.d(TAG, "After genre fill: ${curated.size}")
@@ -171,7 +200,13 @@ class HourlyMixEngine(
      * doesn't correspond to a real artist simply returns nothing and is skipped, so a
      * hallucinated name can never end up in the playlist.
      */
-    private suspend fun suggestedArtistTracks(seeds: List<String>, genre: String, limit: Int): List<String> {
+    private suspend fun suggestedArtistTracks(
+        seeds: List<String>,
+        genre: String,
+        limit: Int,
+        excludeUris: Set<String> = emptySet(),
+        excludeArtists: Set<String> = emptySet()
+    ): List<String> {
         val gemini = geminiClient ?: return emptyList()
         if (seeds.isEmpty()) return emptyList()
 
@@ -179,15 +214,19 @@ class HourlyMixEngine(
             Log.w(TAG, "Artist suggestion failed; skipping discovery tier", it)
             return emptyList()
         }
-        if (suggestions.isEmpty()) return emptyList()
-        Log.d(TAG, "Gemini suggested: ${suggestions.joinToString(", ")}")
+        val filtered = suggestions.filterNot { it.lowercase() in excludeArtists }
+        if (filtered.isEmpty()) return emptyList()
+        Log.d(TAG, "Gemini suggested: ${filtered.joinToString(", ")}")
 
         val uris = mutableListOf<String>()
-        for (name in suggestions) {
+        for (name in filtered) {
             if (uris.size >= limit) break
             // 2 tracks per suggested artist keeps discovery varied across several new artists
             // rather than dropping a block of one unfamiliar act into the hour.
-            uris += webApi.searchTracksByArtist(name, limit = 2).getOrDefault(emptyList()).map { it.uri }
+            uris += webApi.searchTracksByArtist(name, limit = 2)
+                .getOrDefault(emptyList())
+                .filter { it.uri !in excludeUris && it.artistName.lowercase() !in excludeArtists }
+                .map { it.uri }
         }
         return uris.take(limit)
     }
