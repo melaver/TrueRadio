@@ -40,6 +40,7 @@ class SecureSettings(private val context: Context) {
         val SONG_LANGUAGE = stringPreferencesKey("song_language")
         val TUNED_GENRE_OVERRIDE = stringPreferencesKey("tuned_genre_override")
         val DJ_EVERY_N_TRACKS = stringPreferencesKey("dj_every_n_tracks")
+        val VOICE_MODE = stringPreferencesKey("voice_mode")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -63,7 +64,7 @@ class SecureSettings(private val context: Context) {
         ThemeMode.entries.firstOrNull { it.name == prefs[Keys.THEME_MODE] } ?: ThemeMode.SYSTEM
     }
     val djLanguage: Flow<DjLanguage> = context.dataStore.data.map { prefs ->
-        DjLanguage.entries.firstOrNull { it.name == prefs[Keys.DJ_LANGUAGE] } ?: DjLanguage.HEBREW
+        DjLanguage.entries.firstOrNull { it.name == prefs[Keys.DJ_LANGUAGE] } ?: DjLanguage.ENGLISH
     }
     val segmentGenres: Flow<SegmentGenres> = context.dataStore.data.map {
         SegmentGenres.deserialize(it[Keys.SEGMENT_GENRES] ?: "")
@@ -85,6 +86,9 @@ class SecureSettings(private val context: Context) {
      */
     val djEveryNTracks: Flow<Int> = context.dataStore.data.map {
         it[Keys.DJ_EVERY_N_TRACKS]?.toIntOrNull()?.coerceIn(1, 10) ?: 2
+    }
+    val voiceMode: Flow<VoiceMode> = context.dataStore.data.map { prefs ->
+        VoiceMode.entries.firstOrNull { it.name == prefs[Keys.VOICE_MODE] } ?: VoiceMode.BALANCED
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -168,6 +172,10 @@ class SecureSettings(private val context: Context) {
         return value
     }
 
+    suspend fun saveVoiceMode(mode: VoiceMode) {
+        context.dataStore.edit { prefs -> prefs[Keys.VOICE_MODE] = mode.name }
+    }
+
     suspend fun saveDjEveryNTracks(n: Int) {
         context.dataStore.edit { prefs -> prefs[Keys.DJ_EVERY_N_TRACKS] = n.coerceIn(1, 10).toString() }
     }
@@ -198,4 +206,5 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotGenreAnchors(): GenreAnchors = genreAnchors.first()
     suspend fun snapshotSongLanguages(): Set<SongLanguage> = songLanguages.first()
     suspend fun snapshotDjEveryNTracks(): Int = djEveryNTracks.first()
+    suspend fun snapshotVoiceMode(): VoiceMode = voiceMode.first()
 }

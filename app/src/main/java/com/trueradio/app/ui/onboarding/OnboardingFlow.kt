@@ -10,7 +10,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.DaySegment
-import com.trueradio.app.DjLanguage
 import com.trueradio.app.NewsCategory
 import com.trueradio.app.NewsPreferences
 import com.trueradio.app.GenreAnchors
@@ -210,7 +209,6 @@ private fun ApiKeysStep(
 private fun PreferencesStep(settings: SecureSettings) {
     val scope = rememberCoroutineScope()
 
-    val djLanguage by settings.djLanguage.collectAsState(initial = DjLanguage.HEBREW)
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
@@ -220,14 +218,6 @@ private fun PreferencesStep(settings: SecureSettings) {
 
     Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Text("Your preferences", style = MaterialTheme.typography.headlineSmall)
-
-        SectionHeader("DJ language", "Sets the DJ's speaking language and voice.")
-        SingleChoiceChipGrid(
-            options = DjLanguage.entries.toList(),
-            selected = djLanguage,
-            onSelect = { scope.launch { settings.saveDjLanguage(it) } },
-            label = { it.displayName }
-        )
 
         SectionHeader(
             "Song languages",

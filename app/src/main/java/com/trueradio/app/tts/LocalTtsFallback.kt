@@ -45,10 +45,8 @@ class LocalTtsFallback(private val context: Context) {
                 Log.e(TAG, "Local TTS init timed out")
                 return false
             }
-            engine.language = when (language) {
-                DjLanguage.HEBREW -> Locale("iw", "IL")
-                DjLanguage.ENGLISH -> Locale.US
-            }
+            // English only - see DjLanguage for why Hebrew was dropped.
+            engine.language = Locale.US
             val spoke = withTimeoutOrNull(SPEAK_TIMEOUT_MS) { speakOnce(engine, text) }
             if (spoke == null) Log.e(TAG, "Local TTS speak timed out")
             spoke == true

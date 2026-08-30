@@ -36,7 +36,7 @@ import kotlin.random.Random
  */
 class GeminiClient(
     private val apiKey: String,
-    private val language: DjLanguage = DjLanguage.HEBREW
+    private val language: DjLanguage = DjLanguage.ENGLISH
 ) {
     /**
      * Per-process cache of generated artist lists. Genre->artists mappings are effectively static
@@ -110,18 +110,6 @@ class GeminiClient(
         private const val TTS_CHANNELS = 1
         private const val TTS_BITS_PER_SAMPLE = 16
 
-        private val HEBREW_PERSONA = """
-            את/ה שדרן/ית רדיו ישראלי/ת חד/ה, שנון/ה וחם/ה, בסגנון כאן 88 / גלגלצ.
-            כללים מחייבים:
-            1. אסור להתחיל במשפטי פתיחה שחוקים כמו "ועכשיו שמענו את" או "השיר הבא שנשמע הוא" -
-               תמיד תתחיל/י ישר עם משפט פתיחה מפתיע, תובנה תרבותית, או הברקה.
-            2. עדיפות לטריוויה מפתיעה, סיפורי סטודיו, ואנקדוטות שנונות - ולא לעובדות ביוגרפיות יבשות.
-            3. תחביר דיבורי טבעי, משפטים קצרים וקצביים, כמו קריינות רדיו אמיתית.
-            4. הפלט חייב להיות טקסט הניתן להקראה בלבד: פסיקים ומקפים להפסקות דיבור,
-               בלי הוראות בימוי, בלי סוגריים, בלי מרכאות, ובלי תיאורים כמו "(בהתלהבות)".
-            5. אורך: כשלוש משפטים קצרים, לא יותר.
-        """.trimIndent()
-
         private val ENGLISH_PERSONA = """
             You are a sharp, witty, warm radio host in the style of BBC Radio 6 Music or KCRW.
             Hard rules:
@@ -141,98 +129,52 @@ class GeminiClient(
          * Gemini TTS models are multilingual, so the same voice can speak Hebrew or English - the
          * language comes from the script text, not the voice id.
          */
-        fun voiceFor(language: DjLanguage): String = when (language) {
-            DjLanguage.HEBREW -> "Kore"
-            DjLanguage.ENGLISH -> "Charon"
-        }
+        fun voiceFor(language: DjLanguage): String = "Charon"
     }
 
-    private fun persona(): String = when (language) {
-        DjLanguage.HEBREW -> HEBREW_PERSONA
-        DjLanguage.ENGLISH -> ENGLISH_PERSONA
-    }
+    private fun persona(): String = ENGLISH_PERSONA
 
     // ---------------------------------------------------------------- prompts
 
-    private fun trackTransitionPrompt(currentArtist: String, currentTitle: String, nextTitle: String?): String =
-        when (language) {
-            DjLanguage.HEBREW -> {
-                val nextPart = if (nextTitle != null) "והשיר הבא הוא \"$nextTitle\"" else "והשיר הבא כבר בדרך"
-                """
-                ${persona()}
+    private fun trackTransitionPrompt(currentArtist: String, currentTitle: String, nextTitle: String?): String {
+        val nextPart = if (nextTitle != null) "The next track is \"$nextTitle\"." else "The next track is coming up."
+        return """
+            ${persona()}
 
-                המשימה: כתוב/כתבי מעבר רדיופוני קצר בין שירים.
-                השיר שהתנגן: "$currentTitle" של $currentArtist.
-                $nextPart.
-                שלב/י טריוויה שנונה או רקע מפתיע על האמן/ית או השיר, ותוביל/י בצורה חלקה לשיר הבא.
-                """.trimIndent()
-            }
-            DjLanguage.ENGLISH -> {
-                val nextPart = if (nextTitle != null) "The next track is \"$nextTitle\"." else "The next track is coming up."
-                """
-                ${persona()}
-
-                Task: write a short radio transition between songs.
-                Just played: "$currentTitle" by $currentArtist.
-                $nextPart
-                Work in a witty piece of trivia or surprising background about the artist or track,
-                then lead smoothly into what's next.
-                """.trimIndent()
-            }
-        }
+            Task: write a short radio transition between songs.
+            Just played: "$currentTitle" by $currentArtist.
+            $nextPart
+            Work in a witty piece of trivia or surprising background about the artist or track,
+            then lead smoothly into what's next.
+        """.trimIndent()
+    }
 
     private fun hourlyNewsPrompt(headlines: List<String>, likedTopics: List<String>): String {
-        val headlineBlock = headlines.take(5).joinToString("\n") { "- $it" }
-        return when (language) {
-            DjLanguage.HEBREW -> {
-                val preferenceNote = if (likedTopics.isNotEmpty()) {
-                    "\nהמאזין/ת ציין/ה עניין מיוחד בנושאים: ${likedTopics.joinToString(", ")}. " +
-                        "אם אחת הכותרות נוגעת לאחד מהם, תן/י לה דגש והרחבה קלה."
-                } else ""
-                """
-                ${persona()}
-
-                המשימה: כתוב/כתבי מהדורת חדשות קצרה ואנרגטית לתחילת השעה, על בסיס הכותרות:
-                $headlineBlock
-                $preferenceNote
-
-                סכם/י בקול רדיופוני חד ותמציתי, בלי לקרוא כותרת-כותרת כמו רשימה.
-                """.trimIndent()
-            }
-            DjLanguage.ENGLISH -> {
-                val preferenceNote = if (likedTopics.isNotEmpty()) {
-                    "\nThe listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
-                        "If any headline touches those, give it a little more weight and detail."
-                } else ""
-                """
-                ${persona()}
-
-                Task: write a short, energetic top-of-the-hour news update from these headlines:
-                $headlineBlock
-                $preferenceNote
-
-                Summarise in a sharp broadcast voice - don't read them out one by one like a list.
-                """.trimIndent()
-            }
-        }
-    }
-
-    private fun genreChangePrompt(newGenre: String): String = when (language) {
-        DjLanguage.HEBREW -> """
+        val headlineBlock = headlines.take(5).joinToString("
+") { "- $it" }
+        val preferenceNote = if (likedTopics.isNotEmpty()) {
+            "
+The listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
+                "If any headline touches those, give it a little more weight and detail."
+        } else ""
+        return """
             ${persona()}
 
-            המשימה: משפט או שניים קצרים ואנרגטיים שמבשרים על מעבר לסגנון מוזיקלי חדש: $newGenre.
-            שלב/י התייחסות שנונה לסגנון עצמו, בלי לפרט רשימת שירים או אמנים.
-            קצר במיוחד - משפט אחד עד שניים.
-        """.trimIndent()
-        DjLanguage.ENGLISH -> """
-            ${persona()}
+            Task: write a short, energetic top-of-the-hour news update from these headlines:
+            $headlineBlock
+            $preferenceNote
 
-            Task: one or two short, energetic lines announcing a switch to a new musical style: $newGenre.
-            Land a witty observation about the style itself; don't list songs or artists.
-            Very short - one or two sentences.
+            Summarise in a sharp broadcast voice - don't read them out one by one like a list.
         """.trimIndent()
     }
+
+    private fun genreChangePrompt(newGenre: String): String = """
+        ${persona()}
+
+        Task: one or two short, energetic lines announcing a switch to a new musical style: $newGenre.
+        Land a witty observation about the style itself; don't list songs or artists.
+        Very short - one or two sentences.
+    """.trimIndent()
 
     // ---------------------------------------------------------------- request plumbing
 
@@ -364,7 +306,7 @@ class GeminiClient(
         val prompt = """
             ${persona()}
 
-            המשימה / Task: write ONE short radio transition for EACH of the following ${tracks.size} tracks.
+            Task: write ONE short radio transition for EACH of the following ${tracks.size} tracks.
             Each one must follow all the persona rules above, in the same language as those rules.
 
             $numbered

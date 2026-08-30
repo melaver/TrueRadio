@@ -15,7 +15,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.DaySegment
-import com.trueradio.app.DjLanguage
+import com.trueradio.app.VoiceMode
 import com.trueradio.app.GenreAnchors
 import com.trueradio.app.NewsCategory
 import com.trueradio.app.NewsPreferences
@@ -48,7 +48,7 @@ fun SettingsScreen(
     // Force-DJ only makes sense while the service is live; there's no track to talk over otherwise.
     val isRadioRunning by RadioServiceState.isRunning.collectAsState()
     val themeMode by settings.themeMode.collectAsState(initial = ThemeMode.SYSTEM)
-    val djLanguage by settings.djLanguage.collectAsState(initial = DjLanguage.HEBREW)
+    val voiceMode by settings.voiceMode.collectAsState(initial = VoiceMode.BALANCED)
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
@@ -107,12 +107,21 @@ fun SettingsScreen(
             )
 
             HorizontalDivider()
-            SectionHeader("DJ language", "Changes the DJ's prompts and voice. Applies next time you start the radio.")
+            SectionHeader(
+                "DJ voice",
+                "Gemini's voice sounds better but uses API quota on every segment. Balanced keeps " +
+                    "it for news and uses your device's voice for track trivia - about 90% fewer calls."
+            )
             SingleChoiceChipGrid(
-                options = DjLanguage.entries.toList(),
-                selected = djLanguage,
-                onSelect = { scope.launch { settings.saveDjLanguage(it) } },
+                options = VoiceMode.entries.toList(),
+                selected = voiceMode,
+                onSelect = { scope.launch { settings.saveVoiceMode(it) } },
                 label = { it.displayName }
+            )
+            Text(
+                voiceMode.description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             HorizontalDivider()

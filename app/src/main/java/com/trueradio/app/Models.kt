@@ -422,9 +422,37 @@ enum class SongLanguage(val displayName: String, val promptName: String) {
 }
 
 /** Language the DJ speaks. Drives both the Gemini system prompt and the TTS voice selection. */
+/**
+ * The DJ speaks English only.
+ *
+ * Hebrew was dropped because the DJ's voice now runs largely through Android's on-device TTS (see
+ * VoiceMode), and Android's Hebrew voice is materially weaker than its English one - on many
+ * devices the Hebrew voice data isn't installed at all, and the engine silently substitutes a
+ * wrong-language voice. A flat or mispronounced read undercuts the persona badly. Kept as an enum
+ * rather than deleted so the prompt/voice plumbing stays in place if another language is added.
+ */
 enum class DjLanguage(val displayName: String) {
-    HEBREW("עברית"),
     ENGLISH("English")
+}
+
+/**
+ * Where the DJ's voice is synthesized. TTS is the expensive, un-batchable half of Gemini usage
+ * (audio output tokens, one call per segment), so this is the main lever on quota and cost -
+ * script writing stays on Gemini in every mode, since that's what makes the DJ witty.
+ */
+enum class VoiceMode(val displayName: String, val description: String) {
+    /** Gemini voice everywhere. Best quality, highest quota use. */
+    BEST("Best quality", "Gemini voice for everything"),
+
+    /**
+     * Gemini for news and genre changes, on-device for track trivia. Trivia is ~90% of segments,
+     * so this cuts TTS calls by roughly 90% while keeping the good voice for the top-of-hour news
+     * read, where delivery matters most.
+     */
+    BALANCED("Balanced", "Gemini for news, device voice for trivia"),
+
+    /** On-device voice everywhere. No TTS quota, works offline. */
+    OFFLINE("Offline voice", "Device voice for everything, no quota used")
 }
 
 /** User's preferred UI appearance. SYSTEM follows the device's light/dark setting automatically. */

@@ -15,6 +15,7 @@ import com.trueradio.app.TrackInfo
 import com.trueradio.app.TrackVerdict
 import android.util.Log
 import com.trueradio.app.DjLanguage
+import com.trueradio.app.VoiceMode
 import com.trueradio.app.ai.GeminiClient
 import com.trueradio.app.audio.AudioPlaybackManager
 import com.trueradio.app.news.NewsRepository
@@ -97,7 +98,7 @@ class RadioForegroundService : LifecycleService() {
     private var spotifyManager: SpotifyManager? = null
     private var geminiClient: GeminiClient? = null
     private var localTts: LocalTtsFallback? = null
-    private var djLanguage: DjLanguage = DjLanguage.HEBREW
+    private var djLanguage: DjLanguage = DjLanguage.ENGLISH
     private lateinit var newsRepository: NewsRepository
     private lateinit var audioPlaybackManager: AudioPlaybackManager
     private var spotifyWebAuthManager: SpotifyWebAuthManager? = null
@@ -154,6 +155,7 @@ class RadioForegroundService : LifecycleService() {
     /** Tracks played since the DJ last spoke, compared against the user's DJ frequency setting. */
     private var tracksSinceDj = 0
     private var djEveryNTracks = 2
+    private var voiceMode: VoiceMode = VoiceMode.BALANCED
 
     private var remixCount = 0
     /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
@@ -262,6 +264,8 @@ class RadioForegroundService : LifecycleService() {
         val geminiKey = settings.snapshotGeminiKey()
         djLanguage = settings.snapshotDjLanguage()
         djEveryNTracks = settings.snapshotDjEveryNTracks()
+        voiceMode = settings.snapshotVoiceMode()
+        Log.d(DJ_TAG, "Voice mode: $voiceMode")
 
         if (clientId.isBlank()) {
             updateStatus("Missing Spotify client ID - open the app and enter your keys.")
@@ -497,6 +501,13 @@ class RadioForegroundService : LifecycleService() {
                     }
                 Log.d(DJ_TAG, "Step 0: script source = ${if (cached != null) "BATCH CACHE" else "individual call"}")
                 maybeRefillScriptBatch()
+                if (!useGeminiVoice("Trivia")) {
+                    // On-device voice needs no pre-synthesis; cache just the script and let
+                    // speakLine render it at the boundary.
+                    scriptCache["${track.artist}|${track.title}"] = script
+                    Log.d(DJ_TAG, "Step 0: script ready, skipping Gemini TTS (mode=$voiceMode)")
+                    return@launch
+                }
                 val wav = gemini.synthesizeSpeech(script).getOrElse {
                     Log.w(DJ_TAG, "Step 0: prefetch TTS failed (${it.message}) - will retry live at the boundary")
                     return@launch
@@ -722,10 +733,8 @@ class RadioForegroundService : LifecycleService() {
      * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
      * rate limit meant the segment was dropped entirely and the radio just went quiet.
      */
-    private fun fallbackTriviaLine(track: TrackInfo): String = when (djLanguage) {
-        DjLanguage.HEBREW -> "זה היה ${track.artist}, עם ${track.title}. ממשיכים."
-        DjLanguage.ENGLISH -> "That was ${track.artist}, with ${track.title}. Let's keep it going."
-    }
+    private fun fallbackTriviaLine(track: TrackInfo): String =
+        "That was ${track.artist}, with ${track.title}. Let's keep it going."
 
     private suspend fun runTrackTrivia(track: TrackInfo) {
         // Fast path: audio prepared at the start of this track is ready to play immediately.
@@ -781,6 +790,17 @@ class RadioForegroundService : LifecycleService() {
         }
     }
 
+    /**
+     * Whether this segment gets the premium Gemini voice. In BALANCED, trivia (the overwhelming
+     * majority of segments) uses the on-device voice while news and genre changes keep the good
+     * one - those are the moments where delivery carries the most weight.
+     */
+    private fun useGeminiVoice(label: String): Boolean = when (voiceMode) {
+        VoiceMode.BEST -> true
+        VoiceMode.OFFLINE -> false
+        VoiceMode.BALANCED -> !label.startsWith("Trivia")
+    }
+
     private suspend fun speakLine(script: String, label: String) {
         val gemini = geminiClient
         val startedAt = System.currentTimeMillis()
@@ -788,8 +808,13 @@ class RadioForegroundService : LifecycleService() {
         updateStatus("$label: speaking...")
 
         try {
-            val wav = withTimeoutOrNull(SPEECH_TIMEOUT_MS) {
-                gemini?.synthesizeSpeech(script)?.getOrNull()
+            val wav = if (!useGeminiVoice(label)) {
+                Log.d(DJ_TAG, "Step 3: [$label] using on-device voice (mode=$voiceMode) - no Gemini TTS call")
+                null
+            } else {
+                withTimeoutOrNull(SPEECH_TIMEOUT_MS) {
+                    gemini?.synthesizeSpeech(script)?.getOrNull()
+                }
             }
 
             if (wav != null) {

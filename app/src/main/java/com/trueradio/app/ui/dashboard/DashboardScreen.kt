@@ -159,6 +159,11 @@ fun DashboardScreen(
                 )
             }
 
+            Spacer(Modifier.height(20.dp))
+            EngravedLabel("OUTPUT LEVEL")
+            Spacer(Modifier.height(6.dp))
+            VuMeterPanel(isActive = isRunning)
+
             if (isRateLimited) {
                 Spacer(Modifier.height(12.dp))
                 AssistChip(
@@ -319,9 +324,6 @@ private fun DialWindow(
                 strokeWidth = 4f
             )
         }
-
-        Spacer(Modifier.height(4.dp))
-        DialVisualizer(isActive = isRunning)
 
         Spacer(Modifier.height(6.dp))
         Text(
