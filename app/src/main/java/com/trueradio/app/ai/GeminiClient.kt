@@ -45,6 +45,13 @@ class GeminiClient(
      */
     private val artistListCache = mutableMapOf<String, List<String>>()
 
+    /** Seeded from disk at startup and flushed back on change, so restarts don't re-ask Gemini. */
+    fun primeArtistCache(cached: Map<String, List<String>>) {
+        artistListCache.putAll(cached)
+    }
+
+    fun artistCacheSnapshot(): Map<String, List<String>> = artistListCache.toMap()
+
 
 
     private val client: OkHttpClient by lazy {
@@ -167,14 +174,6 @@ The listener has flagged special interest in: ${likedTopics.joinToString(", ")}.
             Summarise in a sharp broadcast voice - don't read them out one by one like a list.
         """.trimIndent()
     }
-
-    private fun genreChangePrompt(newGenre: String): String = """
-        ${persona()}
-
-        Task: one or two short, energetic lines announcing a switch to a new musical style: $newGenre.
-        Land a witty observation about the style itself; don't list songs or artists.
-        Very short - one or two sentences.
-    """.trimIndent()
 
     // ---------------------------------------------------------------- request plumbing
 
@@ -341,8 +340,35 @@ The listener has flagged special interest in: ${likedTopics.joinToString(", ")}.
     suspend fun generateHourlyNews(headlines: List<String>, likedTopics: List<String> = emptyList()): Result<String> =
         generateScript(hourlyNewsPrompt(headlines, likedTopics))
 
-    suspend fun generateGenreChangeLine(newGenre: String): Result<String> =
-        generateScript(genreChangePrompt(newGenre))
+    /**
+     * Generates a bank of reusable generic station lines in ONE call. Played at random between
+     * real trivia segments, so most segments cost nothing at all.
+     *
+     * This is also arguably better radio: real DJs don't have a fresh anecdote for every single
+     * song either - they fill with station identity most of the time.
+     */
+    suspend fun generateEvergreenLines(count: Int = 30): Result<List<String>> {
+        val prompt = """
+            ${persona()}
+
+            Task: write $count SHORT standalone radio lines for a station called TrueRadio.
+            These are generic filler between songs - they must NOT mention any specific artist,
+            song, genre or time of day, because they'll be replayed at random.
+
+            Mix of: station identity, wry observations about music or listening, light remarks
+            about the moment. One or two sentences each, following all the persona rules above.
+
+            Output ONLY the lines, one per line. No numbering, no quotes, no blank lines.
+        """.trimIndent()
+
+        return generateScript(prompt).map { raw ->
+            raw.lines()
+                .map { it.trim().removePrefix("-").removePrefix("*").replace(Regex("^\\d+[.)]\\s*"), "").trim() }
+                .filter { it.length in 15..300 }
+                .distinct()
+                .take(count)
+        }
+    }
 
     /**
      * Names well-known, mainstream artists for a genre.

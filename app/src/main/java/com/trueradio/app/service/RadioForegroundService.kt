@@ -78,9 +78,11 @@ class RadioForegroundService : LifecycleService() {
         private const val PLAYBACK_TICK_MS = 2_000L
         private const val DJ_TAG = "DJ_FLOW"
         /** How many upcoming tracks' scripts to generate per batched request. */
-        private const val SCRIPT_BATCH_SIZE = 5
+        private const val SCRIPT_BATCH_SIZE = 10
         /** Refill the batch when fewer than this many cached scripts remain. */
-        private const val SCRIPT_REFILL_THRESHOLD = 2
+        private const val SCRIPT_REFILL_THRESHOLD = 3
+        /** Play a real trivia script every Nth segment; evergreen filler otherwise. */
+        private const val REAL_TRIVIA_EVERY = 3
         /** Minimum gap between automatic playlist rebuilds; user-initiated remixes ignore this. */
         private const val MIN_MIX_INTERVAL_MS = 10 * 60 * 1000L
         private const val GENRE_WINDOW_MINUTE_CUTOFF = 3 // same top-of-hour window as news
@@ -147,6 +149,10 @@ class RadioForegroundService : LifecycleService() {
     private var batchJob: Job? = null
     /** Keys already batched, so a refill doesn't regenerate scripts for the same tracks. */
     private val consumedScriptKeys = mutableSetOf<String>()
+
+    /** Reusable generic lines, generated once and replayed - see GeminiClient.generateEvergreenLines. */
+    private var evergreenLines: List<String> = emptyList()
+    private var segmentCounter = 0
 
     private var preparedTrackUri: String? = null
     private var preparedAudio: ByteArray? = null
@@ -279,6 +285,13 @@ class RadioForegroundService : LifecycleService() {
         isInitialized = true
         geminiClient = GeminiClient(geminiKey, djLanguage)
         localTts = LocalTtsFallback(applicationContext)
+
+        // Seed caches from disk: the mix is built from the user's top artists, so the same tracks
+        // recur constantly and previously-written scripts are almost always reusable.
+        scriptCache.putAll(settings.loadScriptCache())
+        evergreenLines = settings.loadEvergreenLines()
+        geminiClient?.primeArtistCache(settings.loadArtistListCache())
+        Log.d(DJ_TAG, "Loaded ${scriptCache.size} cached scripts, ${evergreenLines.size} evergreen lines")
         Log.d(TAG, "Initialized DJ (language=$djLanguage, geminiKeyPresent=${geminiKey.isNotBlank()})")
 
         val webAuth = SpotifyWebAuthManager(applicationContext, settings, clientId)
@@ -339,7 +352,17 @@ class RadioForegroundService : LifecycleService() {
             // Only prepare audio for tracks the DJ will actually talk after - each segment costs
             // a Gemini TTS call, and this is the biggest single lever on quota usage.
             if (tracksSinceDj >= djEveryNTracks) {
-                prefetchTriviaFor(track)
+                // Only prepare a real script when the upcoming segment will actually use one -
+                // evergreen segments need nothing prepared, so prefetching for them would pay
+                // Gemini for output that gets discarded.
+                val willUseRealTrivia = (segmentCounter + 1) % REAL_TRIVIA_EVERY == 0
+                if (willUseRealTrivia || evergreenLines.isEmpty()) {
+                    prefetchTriviaFor(track)
+                } else {
+                    Log.d(DJ_TAG, "Next segment is evergreen - skipping prefetch")
+                    preparedAudio = null
+                    preparedTrackUri = null
+                }
             } else {
                 Log.d(DJ_TAG, "Skipping DJ for this track ($tracksSinceDj/$djEveryNTracks)")
                 preparedAudio = null
@@ -526,6 +549,21 @@ class RadioForegroundService : LifecycleService() {
      * published mix. Runs only when the cache is nearly empty, so it costs roughly one Gemini
      * call per five songs instead of one per song.
      */
+    /** Generates the evergreen bank once, on first run. */
+    private fun ensureEvergreenLines() {
+        if (evergreenLines.isNotEmpty()) return
+        val gemini = geminiClient ?: return
+        lifecycleScope.launch {
+            gemini.generateEvergreenLines().getOrNull()?.let { lines ->
+                if (lines.isNotEmpty()) {
+                    evergreenLines = lines
+                    settings.saveEvergreenLines(lines)
+                    Log.d(DJ_TAG, "Generated ${lines.size} evergreen lines (one-time)")
+                }
+            }
+        }
+    }
+
     private fun maybeRefillScriptBatch() {
         if (scriptCache.size >= SCRIPT_REFILL_THRESHOLD) return
         if (batchJob?.isActive == true) return // a refill is already in flight
@@ -553,6 +591,8 @@ class RadioForegroundService : LifecycleService() {
                 }
                 scriptCache.putAll(scripts)
                 consumedScriptKeys += scripts.keys
+                settings.saveScriptCache(scriptCache)
+                geminiClient?.artistCacheSnapshot()?.let { settings.saveArtistListCache(it) }
                 Log.d(DJ_TAG, "Step 0b: BATCH READY - ${scripts.size} scripts cached")
             } catch (e: Exception) {
                 Log.e(DJ_TAG, "Step 0b: batch threw", e)
@@ -715,15 +755,14 @@ class RadioForegroundService : LifecycleService() {
         }
 
         if (announce) {
-            val gemini = geminiClient
-            val line = gemini?.generateGenreChangeLine(genre)?.getOrNull()
-            if (line != null) {
-                speakLine(line, label = "Genre change")
-            }
+            // Templated rather than generated: this line is heard once an hour and its content is
+            // almost entirely the genre name, so a Gemini call bought very little.
+            speakLine(templatedGenreLine(genre), label = "Genre change")
         }
 
         lastMixBuiltAtMs = System.currentTimeMillis()
         manager.playUri(playlistUri)
+        ensureEvergreenLines()
         maybeRefillScriptBatch() // prime the first batch against the new playlist
         updateStatus("On air - $genre")
     }
@@ -733,6 +772,16 @@ class RadioForegroundService : LifecycleService() {
      * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
      * rate limit meant the segment was dropped entirely and the radio just went quiet.
      */
+    private val genreChangeTemplates = listOf(
+        "Switching things up - some %s coming your way.",
+        "Let's change the mood. %s from here.",
+        "Next hour belongs to %s.",
+        "Shifting gears into some %s."
+    )
+
+    private fun templatedGenreLine(genre: String): String =
+        genreChangeTemplates.random().format(genre)
+
     private fun fallbackTriviaLine(track: TrackInfo): String =
         "That was ${track.artist}, with ${track.title}. Let's keep it going."
 
@@ -746,6 +795,17 @@ class RadioForegroundService : LifecycleService() {
             playPreparedAudio(prepared, label = "Trivia")
             return
         }
+        segmentCounter++
+        // Evergreen filler for most segments; a real, track-specific script every Nth. Cuts
+        // trivia generation by two-thirds and reads like an actual station rather than a machine
+        // that has something clever to say about literally every song.
+        if (segmentCounter % REAL_TRIVIA_EVERY != 0 && evergreenLines.isNotEmpty()) {
+            val line = evergreenLines.random()
+            Log.d(DJ_TAG, "Step 2: using EVERGREEN line (segment $segmentCounter)")
+            speakLine(line, label = "Trivia")
+            return
+        }
+
         Log.d(DJ_TAG, "Step 2: no prefetched audio - generating live (may miss the boundary)")
         val gemini = geminiClient ?: return
         Log.d(DJ_TAG, "Step 2: generating script for '${track.artist} - ${track.title}'")

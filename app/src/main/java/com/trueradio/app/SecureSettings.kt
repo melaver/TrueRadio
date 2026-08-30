@@ -19,6 +19,11 @@ private val Context.dataStore by preferencesDataStore(name = "dj_settings")
  */
 class SecureSettings(private val context: Context) {
 
+    companion object {
+        /** Roughly a few weeks of listening; keeps the DataStore entry small. */
+        private const val MAX_CACHED_SCRIPTS = 400
+    }
+
     private object Keys {
         val SPOTIFY_CLIENT_ID = stringPreferencesKey("spotify_client_id")
         val GEMINI_API_KEY = stringPreferencesKey("gemini_api_key")
@@ -41,6 +46,9 @@ class SecureSettings(private val context: Context) {
         val TUNED_GENRE_OVERRIDE = stringPreferencesKey("tuned_genre_override")
         val DJ_EVERY_N_TRACKS = stringPreferencesKey("dj_every_n_tracks")
         val VOICE_MODE = stringPreferencesKey("voice_mode")
+        val SCRIPT_CACHE = stringPreferencesKey("script_cache")
+        val EVERGREEN_LINES = stringPreferencesKey("evergreen_lines")
+        val ARTIST_LIST_CACHE = stringPreferencesKey("artist_list_cache")
     }
 
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
@@ -170,6 +178,61 @@ class SecureSettings(private val context: Context) {
         val value = context.dataStore.data.map { it[Keys.TUNED_GENRE_OVERRIDE] }.first()
         if (value != null) context.dataStore.edit { it.remove(Keys.TUNED_GENRE_OVERRIDE) }
         return value
+    }
+
+    /**
+     * Trivia scripts keyed by "artist|title", persisted across restarts.
+     *
+     * The mix is deliberately built from the user's top artists, so the same tracks recur
+     * constantly - an in-memory cache threw all that work away on every service restart and paid
+     * Gemini again for songs it had already written about. Capped so it can't grow without bound.
+     */
+    suspend fun saveScriptCache(cache: Map<String, String>) {
+        val trimmed = cache.entries.toList().takeLast(MAX_CACHED_SCRIPTS)
+        val blob = trimmed.joinToString("\n") { (k, v) ->
+            k.replace("\u0001", "").replace("\n", " ") + "\u0001" + v.replace("\n", " ")
+        }
+        context.dataStore.edit { prefs -> prefs[Keys.SCRIPT_CACHE] = blob }
+    }
+
+    suspend fun loadScriptCache(): MutableMap<String, String> {
+        val blob = context.dataStore.data.map { it[Keys.SCRIPT_CACHE] ?: "" }.first()
+        if (blob.isBlank()) return mutableMapOf()
+        return blob.split("\n").mapNotNull { line ->
+            val parts = line.split("\u0001")
+            if (parts.size != 2 || parts[0].isBlank()) null else parts[0] to parts[1]
+        }.toMap().toMutableMap()
+    }
+
+    /** Reusable generic DJ lines, generated once and replayed - see EvergreenLines in the service. */
+    suspend fun saveEvergreenLines(lines: List<String>) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.EVERGREEN_LINES] = lines.joinToString("\n") { it.replace("\n", " ") }
+        }
+    }
+
+    suspend fun loadEvergreenLines(): List<String> {
+        val blob = context.dataStore.data.map { it[Keys.EVERGREEN_LINES] ?: "" }.first()
+        return blob.split("\n").map { it.trim() }.filter { it.isNotBlank() }
+    }
+
+    /** Genre -> artist-name lists, stable for weeks; persisted so restarts don't re-ask Gemini. */
+    suspend fun saveArtistListCache(cache: Map<String, List<String>>) {
+        val blob = cache.entries.joinToString("\n") { (k, v) ->
+            k.replace("\u0001", "") + "\u0001" + v.joinToString(",") { a -> a.replace(",", " ") }
+        }
+        context.dataStore.edit { prefs -> prefs[Keys.ARTIST_LIST_CACHE] = blob }
+    }
+
+    suspend fun loadArtistListCache(): MutableMap<String, List<String>> {
+        val blob = context.dataStore.data.map { it[Keys.ARTIST_LIST_CACHE] ?: "" }.first()
+        if (blob.isBlank()) return mutableMapOf()
+        return blob.split("\n").mapNotNull { line ->
+            val parts = line.split("\u0001")
+            if (parts.size != 2 || parts[0].isBlank()) return@mapNotNull null
+            val artists = parts[1].split(",").map { it.trim() }.filter { it.isNotBlank() }
+            if (artists.isEmpty()) null else parts[0] to artists
+        }.toMap().toMutableMap()
     }
 
     suspend fun saveVoiceMode(mode: VoiceMode) {
