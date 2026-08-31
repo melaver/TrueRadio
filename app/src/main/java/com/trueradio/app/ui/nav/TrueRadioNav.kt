@@ -40,7 +40,8 @@ fun TrueRadioNavHost(
     onLike: () -> Unit,
     onDislike: () -> Unit,
     onForceDj: () -> Unit,
-    onRemix: () -> Unit
+    onRemix: () -> Unit,
+    onForceNews: () -> Unit
 ) {
     // null = still loading; avoids rendering a start destination we might have to change.
     val onboardingComplete by produceState<Boolean?>(initialValue = null) {
@@ -85,6 +86,7 @@ fun TrueRadioNavHost(
                 onLike = onLike,
                 onDislike = onDislike,
                 onRemix = onRemix,
+                onForceNews = onForceNews,
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) }
             )
         }

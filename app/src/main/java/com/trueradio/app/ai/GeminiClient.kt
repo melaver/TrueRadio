@@ -157,11 +157,9 @@ class GeminiClient(
     }
 
     private fun hourlyNewsPrompt(headlines: List<String>, likedTopics: List<String>): String {
-        val headlineBlock = headlines.take(5).joinToString("
-") { "- $it" }
+        val headlineBlock = headlines.take(5).joinToString("\n") { "- $it" }
         val preferenceNote = if (likedTopics.isNotEmpty()) {
-            "
-The listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
+            "\nThe listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
                 "If any headline touches those, give it a little more weight and detail."
         } else ""
         return """

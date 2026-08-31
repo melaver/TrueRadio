@@ -62,6 +62,8 @@ class RadioForegroundService : LifecycleService() {
         const val ACTION_FORCE_DJ = "com.trueradio.app.action.FORCE_DJ"
         /** Rebuild this hour's mix on demand with fresh material and start playing it. */
         const val ACTION_REMIX = "com.trueradio.app.action.REMIX"
+        /** Debug/manual: read the news flash immediately, resetting the 20-minute timer. */
+        const val ACTION_FORCE_NEWS = "com.trueradio.app.action.FORCE_NEWS"
         const val EXTRA_SPOTIFY_CLIENT_ID = "extra_spotify_client_id"
         private const val NOTIFICATION_ID = 42
         private const val TRIVIA_TRIGGER_WINDOW_MS = 15_000L
@@ -237,6 +239,10 @@ class RadioForegroundService : LifecycleService() {
             }
             ACTION_REMIX -> {
                 remixCurrentMix()
+                return START_STICKY
+            }
+            ACTION_FORCE_NEWS -> {
+                forceNewsFlash()
                 return START_STICKY
             }
             ACTION_FORCE_DJ -> {
@@ -657,6 +663,26 @@ class RadioForegroundService : LifecycleService() {
                 updateStatus("Remix failed")
             } finally {
                 isRemixing = false
+            }
+        }
+    }
+
+    /**
+     * Reads the news on demand. Resets the playback timer so a manual read doesn't get followed
+     * moments later by the scheduled one.
+     */
+    private fun forceNewsFlash() {
+        if (!speakingMutex.tryLock()) {
+            Log.w(DJ_TAG, "FORCE NEWS: DJ already speaking, ignoring")
+            return
+        }
+        playbackMsSinceNews = 0L
+        Log.d(DJ_TAG, "FORCE NEWS: manual news flash requested")
+        lifecycleScope.launch {
+            try {
+                runNewsFlash()
+            } finally {
+                speakingMutex.unlock()
             }
         }
     }

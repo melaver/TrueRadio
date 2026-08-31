@@ -13,6 +13,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ThumbDown
@@ -55,6 +56,7 @@ fun DashboardScreen(
     onLike: () -> Unit,
     onDislike: () -> Unit,
     onRemix: () -> Unit,
+    onForceNews: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -152,11 +154,18 @@ fun DashboardScreen(
 
             if (isRunning && nowPlaying != null) {
                 Spacer(Modifier.height(16.dp))
-                SmallKnobButton(
-                    icon = { Icon(Icons.Default.Refresh, null, tint = RadioPalette.Champagne) },
-                    label = "REMIX",
-                    onClick = onRemix
-                )
+                Row(horizontalArrangement = Arrangement.spacedBy(28.dp)) {
+                    SmallKnobButton(
+                        icon = { Icon(Icons.Default.Refresh, null, tint = RadioPalette.Champagne) },
+                        label = "REMIX",
+                        onClick = onRemix
+                    )
+                    SmallKnobButton(
+                        icon = { Icon(Icons.Default.Campaign, null, tint = RadioPalette.Champagne) },
+                        label = "NEWS",
+                        onClick = onForceNews
+                    )
+                }
             }
 
             Spacer(Modifier.height(20.dp))

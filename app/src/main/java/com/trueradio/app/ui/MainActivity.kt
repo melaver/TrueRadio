@@ -73,7 +73,8 @@ class MainActivity : ComponentActivity() {
                         onLike = { sendServiceAction(RadioForegroundService.ACTION_LIKE) },
                         onDislike = { sendServiceAction(RadioForegroundService.ACTION_DISLIKE) },
                         onForceDj = { sendServiceAction(RadioForegroundService.ACTION_FORCE_DJ) },
-                        onRemix = { sendServiceAction(RadioForegroundService.ACTION_REMIX) }
+                        onRemix = { sendServiceAction(RadioForegroundService.ACTION_REMIX) },
+                        onForceNews = { sendServiceAction(RadioForegroundService.ACTION_FORCE_NEWS) }
                     )
                 }
             }
