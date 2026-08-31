@@ -1,6 +1,5 @@
 package com.trueradio.app.ai
 
-import android.util.Base64
 import android.util.Log
 import com.trueradio.app.DjLanguage
 import kotlinx.coroutines.Dispatchers
@@ -13,43 +12,39 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
- * Owns both halves of the DJ's voice:
- * Script generation only. Speech is handled by CloudTtsClient - Gemini's TTS models are
- * preview-only with limits this app kept exhausting, whereas Cloud TTS is a separate product with
- * a large permanent free allowance. Splitting them keeps Gemini on the cheap, batchable half.
+ * Text generation only: DJ scripts, artist suggestions, evergreen lines.
  *
+ * Speech is handled by CloudTtsClient. Gemini's TTS models are preview-only with limits this app
+ * kept exhausting, whereas Cloud TTS is a separate product with a large permanent free allowance.
+ * Splitting them keeps Gemini on the cheap, batchable half of the work.
  */
 class GeminiClient(
     private val apiKey: String,
     private val language: DjLanguage = DjLanguage.ENGLISH
 ) {
     /**
-     * Per-process cache of generated artist lists. Genre->artists mappings are effectively static
-     * between mixes, so re-asking on every playlist rebuild burns quota for no new information -
-     * a meaningful cause of 429s on free-tier keys.
+     * Per-process cache of generated artist lists. Genre->artist mappings are effectively static
+     * between mixes, so re-asking on every playlist rebuild burns quota for no new information.
+     * Seeded from disk at startup via [primeArtistCache].
      */
     private val artistListCache = mutableMapOf<String, List<String>>()
 
-    /** Seeded from disk at startup and flushed back on change, so restarts don't re-ask Gemini. */
     fun primeArtistCache(cached: Map<String, List<String>>) {
         artistListCache.putAll(cached)
     }
 
     fun artistCacheSnapshot(): Map<String, List<String>> = artistListCache.toMap()
 
-
-
     private val client: OkHttpClient by lazy {
         val logging = HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC }
         OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS) // TTS synthesis is slower than text generation
+            .readTimeout(45, TimeUnit.SECONDS)
             .addInterceptor(logging)
             .build()
     }
@@ -58,11 +53,25 @@ class GeminiClient(
         private const val TAG = "GeminiClient"
 
         /**
-         * Process-wide 429 backoff. Retrying into a rate limit makes it WORSE - every retry
-         * counts against the same quota - so once Gemini returns 429, all calls are refused
-         * locally until this expires. Failing instantly also beats three slow retries that end
-         * in silence anyway.
+         * Rolling alias Google maintains pointing at their current recommended Flash model, used
+         * instead of a dated id (a hardcoded "gemini-2.5-flash" started 404ing for newly-created
+         * API keys as Google phased it out). Avoids this breaking again as the lineup advances.
          */
+        private const val TEXT_MODEL = "gemini-flash-latest"
+        private const val ENDPOINT_TEMPLATE =
+            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
+
+        private const val MAX_ATTEMPTS = 3
+        private const val INITIAL_BACKOFF_MS = 1_000L
+
+        /**
+         * 429 deliberately excluded: it's a quota limit, handled by the circuit breaker below.
+         * Retrying it just consumes more quota.
+         */
+        private val RETRYABLE_CODES = setOf(500, 502, 503, 504)
+
+        // ---- Process-wide rate-limit circuit breaker ----
+
         @Volatile
         private var rateLimitedUntilMs = 0L
         @Volatile
@@ -71,22 +80,21 @@ class GeminiClient(
         private var lastTripAtMs = 0L
 
         /**
-         * Escalating cooldowns. A fixed 5-minute pause works for a burst (per-minute) limit, but
-         * if the DAILY quota is exhausted the very next call after the cooldown fails again -
-         * an endless 429-wait-429 loop that never recovers and keeps burning failed requests.
-         * Backing off further each time a trip recurs quickly turns that loop into a few attempts
-         * spread over hours, which is the only sane behaviour against a daily cap.
+         * Escalating cooldowns. A fixed short pause works for a burst (per-minute) limit, but if
+         * the DAILY quota is exhausted the very next call after the cooldown fails again - an
+         * endless 429-wait-429 loop. Backing off further each time a trip recurs quickly turns
+         * that into a few attempts spread over hours, which is the only sane response to a daily cap.
          */
         private val COOLDOWN_LADDER_MS = longArrayOf(
-            5 * 60 * 1000L,    // first trip: assume a burst limit
+            5 * 60 * 1000L,
             15 * 60 * 1000L,
             60 * 60 * 1000L,
-            3 * 60 * 60 * 1000L // repeated trips: almost certainly a daily cap
+            3 * 60 * 60 * 1000L
         )
-        /** A trip this soon after the last one means the previous cooldown didn't help. */
         private const val ESCALATE_WINDOW_MS = 10 * 60 * 1000L
 
         fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntilMs
+
         fun rateLimitSecondsRemaining(): Long =
             ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
 
@@ -95,7 +103,8 @@ class GeminiClient(
 
         private fun tripRateLimit() {
             val now = System.currentTimeMillis()
-            consecutiveTrips = if (now - lastTripAtMs < rateLimitedUntilMs - lastTripAtMs + ESCALATE_WINDOW_MS) {
+            // A trip arriving soon after the previous cooldown ended means that cooldown didn't help.
+            consecutiveTrips = if (now - lastTripAtMs < COOLDOWN_LADDER_MS[consecutiveTrips] + ESCALATE_WINDOW_MS) {
                 (consecutiveTrips + 1).coerceAtMost(COOLDOWN_LADDER_MS.size - 1)
             } else {
                 0
@@ -104,37 +113,11 @@ class GeminiClient(
             rateLimitedUntilMs = now + COOLDOWN_LADDER_MS[consecutiveTrips]
         }
 
-        /** Called after any success, so a recovered quota returns to short cooldowns. */
         private fun noteSuccess() {
             if (consecutiveTrips != 0 && System.currentTimeMillis() - lastTripAtMs > ESCALATE_WINDOW_MS) {
                 consecutiveTrips = 0
             }
         }
-
-        /**
-         * Rolling alias Google maintains pointing at their current recommended Flash model, used
-         * instead of a dated id (a hardcoded "gemini-2.5-flash" started 404ing for newly-created
-         * API keys as Google phased it out ahead of its Oct 16 2026 shutdown). Avoids this
-         * breaking again as the Flash lineup advances.
-         */
-        private const val TEXT_MODEL = "gemini-flash-latest"
-
-
-        private const val ENDPOINT_TEMPLATE =
-            "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
-
-        /**
-         * Transient-failure retry policy. Gemini returns 503 (UNAVAILABLE / "model overloaded")
-         * fairly regularly on free-tier and preview models at busy times, and 429 when rate
-         * limited - neither means anything is misconfigured, and both usually succeed moments
-         * later. Without retries a single blip silently costs the listener a whole DJ segment.
-         */
-        private const val MAX_ATTEMPTS = 3
-        private const val INITIAL_BACKOFF_MS = 1_000L
-        // 429 deliberately excluded: it's a quota limit, handled by the circuit breaker above.
-        // Retrying it just consumes more quota.
-        private val RETRYABLE_CODES = setOf(500, 502, 503, 504)
-
 
         private val ENGLISH_PERSONA = """
             You are a sharp, witty, warm radio host in the style of BBC Radio 6 Music or KCRW.
@@ -148,6 +131,59 @@ class GeminiClient(
                stage directions, no brackets, no quotation marks, no cues like "(excitedly)".
             5. Length: about three short sentences, no more.
         """.trimIndent()
+    }
+
+    private fun persona(): String = ENGLISH_PERSONA
+
+    // ---------------------------------------------------------------- prompts
+
+    private fun trackTransitionPrompt(currentArtist: String, currentTitle: String, nextTitle: String?): String {
+        val nextPart = if (nextTitle != null) "The next track is \"$nextTitle\"." else "The next track is coming up."
+        return """
+            ${persona()}
+
+            Task: write a short radio transition between songs.
+            Just played: "$currentTitle" by $currentArtist.
+            $nextPart
+            Work in a witty piece of trivia or surprising background about the artist or track,
+            then lead smoothly into what's next.
+        """.trimIndent()
+    }
+
+    private fun hourlyNewsPrompt(
+        headlines: List<String>,
+        likedTopics: List<String>,
+        lengthHint: String
+    ): String {
+        val headlineBlock = headlines.joinToString("\n") { "- $it" }
+        val preferenceNote = if (likedTopics.isNotEmpty()) {
+            "\nThe listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
+                "If any headline touches those, give it a little more weight and detail."
+        } else ""
+        return """
+            ${persona()}
+
+            Task: write a short, energetic top-of-the-hour news update from these headlines:
+            $headlineBlock
+            $preferenceNote
+
+            Length: $lengthHint
+            Summarise in a sharp broadcast voice - don't read them out one by one like a list.
+        """.trimIndent()
+    }
+
+    // ---------------------------------------------------------------- request plumbing
+
+    /**
+     * Executes [block] with exponential backoff on transient failures. Retries only the codes in
+     * [RETRYABLE_CODES] plus raw network errors - a 400 or 404 would fail identically every time,
+     * so retrying those just delays the fallback.
+     */
+    private suspend fun <T> withRetries(label: String, block: suspend () -> Result<T>): Result<T> {
+        if (isRateLimited()) {
+            Log.w(TAG, "[$label] skipped - rate limited for another ${rateLimitSecondsRemaining()}s")
+            return Result.failure(IOException("Gemini rate limited (${rateLimitSecondsRemaining()}s remaining)"))
+        }
 
         var lastFailure: Throwable? = null
         repeat(MAX_ATTEMPTS) { attempt ->
@@ -159,21 +195,22 @@ class GeminiClient(
 
             val error = result.exceptionOrNull()
             lastFailure = error
-            // A 429 means quota, not transient load - stop retrying immediately and lock out
-            // further calls, otherwise the retries deepen the hole.
+
+            // 429 means quota, not transient load - stop immediately and lock out further calls.
             if (error?.message?.contains("429") == true) {
                 tripRateLimit()
-                Log.e(TAG, "[$label] RATE LIMITED (429) - pausing all Gemini calls for ${rateLimitSecondsRemaining() / 60} minutes" +
+                Log.e(TAG, "[$label] RATE LIMITED (429) - pausing Gemini for ${rateLimitSecondsRemaining() / 60}m" +
                     if (isLikelyDailyQuotaExhausted()) " (repeated trips suggest the DAILY quota is exhausted)" else "")
                 return Result.failure(error)
             }
-            val retryable = (error as? RetryableHttpException) != null
+
+            val retryable = error is RetryableHttpException
             if (!retryable || attempt == MAX_ATTEMPTS - 1) {
-                if (!retryable) Log.e(TAG, "[$label] non-retryable failure; giving up", error)
-                else Log.e(TAG, "[$label] still failing after $MAX_ATTEMPTS attempts", error)
+                Log.e(TAG, "[$label] giving up after ${attempt + 1} attempt(s)", error)
                 return Result.failure(error ?: IOException("$label failed"))
             }
 
+            // Jitter so simultaneous failures don't retry in lockstep against a busy backend.
             val backoff = INITIAL_BACKOFF_MS * (1L shl attempt) + Random.nextLong(250)
             Log.w(TAG, "[$label] transient failure (${error?.message}); retrying in ${backoff}ms")
             delay(backoff)
@@ -186,7 +223,6 @@ class GeminiClient(
 
     // ---------------------------------------------------------------- text generation
 
-    /** Generates a DJ script. Returns failure rather than throwing so callers can fall back. */
     suspend fun generateScript(prompt: String): Result<String> =
         withRetries("script") { generateScriptOnce(prompt) }
 
@@ -200,7 +236,7 @@ class GeminiClient(
                 )
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.9)
-                    put("maxOutputTokens", 220)
+                    put("maxOutputTokens", 600)
                 })
             }
             val request = Request.Builder()
@@ -233,8 +269,7 @@ class GeminiClient(
                 Log.d(TAG, "Script generated (${text.length} chars)")
                 Result.success(text.trim())
             }
-        } catch (e: java.io.IOException) {
-            // Raw network failures (timeout, DNS, connection reset) are worth retrying too.
+        } catch (e: IOException) {
             Log.e(TAG, "Script generation network error", e)
             Result.failure(RetryableHttpException(e.message ?: "network error"))
         } catch (e: Exception) {
@@ -246,19 +281,22 @@ class GeminiClient(
     suspend fun generateTrackTransition(currentArtist: String, currentTitle: String, nextTitle: String?): Result<String> =
         generateScript(trackTransitionPrompt(currentArtist, currentTitle, nextTitle))
 
+    suspend fun generateHourlyNews(
+        headlines: List<String>,
+        likedTopics: List<String> = emptyList(),
+        lengthHint: String = "About three short sentences."
+    ): Result<String> = generateScript(hourlyNewsPrompt(headlines, likedTopics, lengthHint))
+
     /**
-     * Generates transition scripts for several upcoming tracks in ONE request.
+     * Generates transition scripts for several upcoming tracks in ONE request - five separate
+     * trivia calls become one.
      *
-     * Script generation is the easiest place to cut Gemini call volume: five separate trivia
-     * calls become one. (TTS cannot be batched - each request returns a single audio stream - so
-     * audio is still synthesized per track, just later and lazily.)
-     *
-     * Returns a map of "artist|title" -> script. Keyed on the input pair rather than array
-     * position because a model that drops or reorders an entry would otherwise silently attach
-     * the wrong trivia to the wrong song, which is worse than having no trivia.
+     * Returns a map of "artist|title" -> script, keyed on the input pair rather than array
+     * position: a model that drops or reorders an entry would otherwise silently attach the wrong
+     * trivia to the wrong song, which is worse than having none.
      */
     suspend fun generateTrackTransitionBatch(
-        tracks: List<Pair<String, String>> // artist to title
+        tracks: List<Pair<String, String>>
     ): Result<Map<String, String>> {
         if (tracks.isEmpty()) return Result.success(emptyMap())
 
@@ -268,7 +306,7 @@ class GeminiClient(
             ${persona()}
 
             Task: write ONE short radio transition for EACH of the following ${tracks.size} tracks.
-            Each one must follow all the persona rules above, in the same language as those rules.
+            Each must follow all the persona rules above.
 
             $numbered
 
@@ -280,7 +318,7 @@ class GeminiClient(
         """.trimIndent()
 
         return generateScript(prompt).mapCatching { raw ->
-            // Models frequently wrap JSON in markdown fences despite instructions to the contrary.
+            // Models frequently wrap JSON in markdown fences despite instructions otherwise.
             val cleaned = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
             val array = JSONArray(cleaned)
             val result = mutableMapOf<String, String>()
@@ -288,8 +326,6 @@ class GeminiClient(
                 val obj = array.optJSONObject(i) ?: continue
                 val n = obj.optInt("n", -1)
                 val script = obj.optString("script").takeIf { it.isNotBlank() } ?: continue
-                // Map back by the number the model was given, so a dropped or reordered entry
-                // can't misalign scripts with tracks.
                 val track = tracks.getOrNull(n - 1) ?: continue
                 result["${track.first}|${track.second}"] = script.trim()
             }
@@ -299,18 +335,10 @@ class GeminiClient(
         }
     }
 
-    suspend fun generateHourlyNews(
-        headlines: List<String>,
-        likedTopics: List<String> = emptyList(),
-        lengthHint: String = "About three short sentences."
-    ): Result<String> = generateScript(hourlyNewsPrompt(headlines, likedTopics, lengthHint))
-
     /**
-     * Generates a bank of reusable generic station lines in ONE call. Played at random between
-     * real trivia segments, so most segments cost nothing at all.
-     *
-     * This is also arguably better radio: real DJs don't have a fresh anecdote for every single
-     * song either - they fill with station identity most of the time.
+     * Generates a bank of reusable generic station lines in ONE call, played at random between
+     * real trivia segments so most segments cost nothing. Also arguably better radio: real DJs
+     * don't have a fresh anecdote for every single song either.
      */
     suspend fun generateEvergreenLines(count: Int = 30): Result<List<String>> {
         val prompt = """
@@ -321,7 +349,7 @@ class GeminiClient(
             song, genre or time of day, because they'll be replayed at random.
 
             Mix of: station identity, wry observations about music or listening, light remarks
-            about the moment. One or two sentences each, following all the persona rules above.
+            about the moment. One or two sentences each.
 
             Output ONLY the lines, one per line. No numbering, no quotes, no blank lines.
         """.trimIndent()
@@ -336,23 +364,18 @@ class GeminiClient(
     }
 
     /**
-     * Names well-known, mainstream artists for a genre.
+     * Names well-known, mainstream artists for a genre - a POPULARITY PROXY.
      *
-     * This exists as a POPULARITY PROXY. Spotify's February 2026 migration stripped the
-     * `popularity` field from track and artist objects, and `/recommendations` (which accepted
-     * min_popularity/target_popularity) was removed in November 2024 - so there is no longer any
-     * API-side way to ask for "well-known artists only". Gemini knows which acts are household
-     * names, and every name it returns is resolved through Spotify search, so a hallucinated
-     * artist simply yields no results and is skipped.
+     * Spotify's February 2026 migration stripped the `popularity` field from track and artist
+     * objects, and `/recommendations` (which accepted min_popularity) was removed in November
+     * 2024, so there is no API-side way to ask for "well-known artists only". Every name returned
+     * is resolved through Spotify search, so a hallucinated artist yields no results and is skipped.
      */
     suspend fun suggestMainstreamArtists(
         genre: String,
         count: Int = 10,
         songLanguage: String? = null
     ): Result<List<String>> {
-        // Artist lists for a genre barely change between mixes, so caching them removes a whole
-        // API call per playlist rebuild. That call volume is a direct contributor to 429 rate
-        // limiting on free-tier keys, and it competes with the trivia calls that actually matter.
         val cacheKey = "mainstream:${genre.lowercase()}:${songLanguage ?: "any"}"
         artistListCache[cacheKey]?.let {
             Log.d(TAG, "Using cached mainstream artists for '$genre'")
@@ -372,22 +395,19 @@ class GeminiClient(
             - Favour commercially successful and widely played artists.$languageRule
             - Output ONLY the artist names, one per line. No numbering, no commentary, no blank lines.
         """.trimIndent()
-        return generateScript(prompt).map { parseArtistList(it, count).also { list -> artistListCache[cacheKey] = list } }
+
+        return generateScript(prompt).map { raw ->
+            parseArtistList(raw, count).also { artistListCache[cacheKey] = it }
+        }
     }
 
     /**
      * Suggests artists the listener is likely to enjoy, given artists they already love.
      *
-     * This exists because Spotify has **no similarity endpoint anymore** - both
-     * `/v1/recommendations` and `/v1/artists/{id}/related-artists` were deprecated in November
-     * 2024 and return 404 for current API clients. Without them there is no way to ask Spotify
-     * "who is like this artist". Gemini has broad music knowledge, so it stands in as the
-     * similarity engine; the names it returns are then resolved to real playable tracks via
-     * Spotify search, so nothing hallucinated can reach the playlist - an artist that doesn't
-     * exist simply returns no search results and is skipped.
-     *
-     * Returns a plain list of artist names. Asks for names only, since anything conversational
-     * would have to be stripped back out.
+     * Exists because Spotify has no similarity endpoint anymore - both `/recommendations` and
+     * `/artists/{id}/related-artists` were deprecated in November 2024. Gemini stands in as the
+     * similarity engine; names are resolved via Spotify search so nothing hallucinated can reach
+     * the playlist.
      */
     suspend fun suggestSimilarArtists(
         seedArtists: List<String>,
@@ -396,37 +416,41 @@ class GeminiClient(
         songLanguage: String? = null
     ): Result<List<String>> {
         if (seedArtists.isEmpty()) return Result.success(emptyList())
-        val cacheKey = "similar:${genre.lowercase()}:${songLanguage ?: "any"}:${seedArtists.take(5).joinToString(",").lowercase()}"
+
+        val cacheKey = "similar:${genre.lowercase()}:${songLanguage ?: "any"}:" +
+            seedArtists.take(5).joinToString(",").lowercase()
         artistListCache[cacheKey]?.let {
             Log.d(TAG, "Using cached similar artists for '$genre'")
             return Result.success(it)
         }
+
+        val languageRule = songLanguage?.let {
+            "\n            - CRITICAL: only artists who primarily perform in $it."
+        } ?: ""
         val prompt = """
             You are a music recommendation engine. A listener's favourite artists include:
             ${seedArtists.take(12).joinToString(", ")}
 
             Suggest exactly $count OTHER artists in or adjacent to the "$genre" genre that this
-            listener would likely enjoy, based on the sound, era and sensibility of the artists above.
+            listener would likely enjoy, based on the sound, era and sensibility of those artists.
 
             Hard rules:
             - Do NOT include any artist already listed above.
-            - Only suggest real, existing recording artists.${songLanguage?.let { "\n            - CRITICAL: only artists who primarily perform in $it." } ?: ""}
-            - Output ONLY the artist names, one per line. No numbering, no commentary, no genres,
-              no explanations, no blank lines.
+            - Only suggest real, existing recording artists.$languageRule
+            - Output ONLY the artist names, one per line. No numbering, no commentary, no blank lines.
         """.trimIndent()
 
         return generateScript(prompt).map { raw ->
             parseArtistList(raw, count)
-                // Guard against the model echoing a seed artist back despite being told not to.
+                // Guard against the model echoing a seed back despite being told not to.
                 .filterNot { suggestion -> seedArtists.any { it.equals(suggestion, ignoreCase = true) } }
                 .also { artistListCache[cacheKey] = it }
         }
     }
 
     /**
-     * Shared parser for the artist-name list responses. Models sometimes ignore "no
-     * numbering/bullets" instructions, so common list prefixes are stripped rather than trusting
-     * compliance.
+     * Shared parser for artist-name list responses. Models sometimes ignore "no numbering/bullets"
+     * instructions, so common list prefixes are stripped rather than trusting compliance.
      */
     private fun parseArtistList(raw: String, count: Int): List<String> =
         raw.lines()
@@ -439,6 +463,4 @@ class GeminiClient(
             .filter { it.isNotBlank() && it.length in 2..60 }
             .distinct()
             .take(count)
-
-
 }
