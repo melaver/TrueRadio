@@ -435,6 +435,13 @@ enum class DjLanguage(val displayName: String) {
     ENGLISH("English")
 }
 
+/** How long the top-of-the-hour news read should be. */
+enum class NewsLength(val displayName: String, val headlineCount: Int, val promptHint: String) {
+    BRIEF("Brief", 3, "Keep it to two short sentences - just the essentials."),
+    STANDARD("Standard", 5, "About three short sentences."),
+    EXTENDED("Extended", 8, "Four to five sentences, with a little more context on the bigger stories.")
+}
+
 /**
  * Where the DJ's voice is synthesized. TTS is the expensive, un-batchable half of Gemini usage
  * (audio output tokens, one call per segment), so this is the main lever on quota and cost -

@@ -503,6 +503,10 @@ class RadioForegroundService : LifecycleService() {
      * the time the boundary arrives. See [preparedTrackUri] for why.
      */
     private fun prefetchTriviaFor(track: TrackInfo) {
+        if (GeminiClient.isRateLimited()) {
+            Log.d(DJ_TAG, "Skipping prefetch - rate limited for ${GeminiClient.rateLimitSecondsRemaining()}s")
+            return
+        }
         // Don't prefetch for very short tracks - the boundary may arrive before generation
         // finishes, and it would just waste a call.
         if (track.durationMs in 1..45_000) {
@@ -558,6 +562,7 @@ class RadioForegroundService : LifecycleService() {
     /** Generates the evergreen bank once, on first run. */
     private fun ensureEvergreenLines() {
         if (evergreenLines.isNotEmpty()) return
+        if (GeminiClient.isRateLimited()) return
         val gemini = geminiClient ?: return
         lifecycleScope.launch {
             gemini.generateEvergreenLines().getOrNull()?.let { lines ->
@@ -571,6 +576,7 @@ class RadioForegroundService : LifecycleService() {
     }
 
     private fun maybeRefillScriptBatch() {
+        if (GeminiClient.isRateLimited()) return
         if (scriptCache.size >= SCRIPT_REFILL_THRESHOLD) return
         if (batchJob?.isActive == true) return // a refill is already in flight
 
@@ -716,12 +722,20 @@ class RadioForegroundService : LifecycleService() {
         val gemini = geminiClient ?: return
         updateStatus("Fetching news...")
         val preferences = settings.snapshotNewsPreferences()
-        val headlinesResult = newsRepository.fetchTopHeadlines(preferences = preferences)
+        val newsLength = settings.snapshotNewsLength()
+        val headlinesResult = newsRepository.fetchTopHeadlines(
+            limit = newsLength.headlineCount,
+            preferences = preferences
+        )
         val headlines = headlinesResult.getOrElse {
             updateStatus("News fetch failed: ${it.message}")
             return
         }
-        val scriptResult = gemini.generateHourlyNews(headlines, likedTopics = preferences.likedTopics)
+        val scriptResult = gemini.generateHourlyNews(
+            headlines,
+            likedTopics = preferences.likedTopics,
+            lengthHint = newsLength.promptHint
+        )
         val script = scriptResult.getOrElse {
             updateStatus("News script generation failed: ${it.message}")
             return
@@ -863,7 +877,7 @@ class RadioForegroundService : LifecycleService() {
         updateStatus("$label: speaking...")
         try {
             val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
-                audioPlaybackManager.playDuckedAudio(wav)
+                audioPlaybackManager.playDuckedAudio(wav, settings.snapshotDjVolume())
                 true
             }
             if (played == null) Log.e(DJ_TAG, "Step 6: [$label] PLAYBACK TIMED OUT")
@@ -906,7 +920,7 @@ class RadioForegroundService : LifecycleService() {
             if (wav != null) {
                 Log.d(DJ_TAG, "Step 4: [$label] API SUCCESS - ${wav.size} bytes in ${System.currentTimeMillis() - startedAt}ms")
                 val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
-                    audioPlaybackManager.playDuckedAudio(wav)
+                    audioPlaybackManager.playDuckedAudio(wav, settings.snapshotDjVolume())
                     true
                 }
                 if (played == null) {

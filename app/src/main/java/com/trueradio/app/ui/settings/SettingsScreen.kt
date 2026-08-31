@@ -15,6 +15,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.DaySegment
+import com.trueradio.app.NewsLength
 import com.trueradio.app.VoiceMode
 import com.trueradio.app.GenreAnchors
 import com.trueradio.app.NewsCategory
@@ -49,6 +50,8 @@ fun SettingsScreen(
     val isRadioRunning by RadioServiceState.isRunning.collectAsState()
     val themeMode by settings.themeMode.collectAsState(initial = ThemeMode.SYSTEM)
     val voiceMode by settings.voiceMode.collectAsState(initial = VoiceMode.BALANCED)
+    val newsLength by settings.newsLength.collectAsState(initial = NewsLength.STANDARD)
+    val djVolume by settings.djVolume.collectAsState(initial = 1.0f)
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())

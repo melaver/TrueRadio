@@ -47,12 +47,12 @@ class AudioPlaybackManager(private val context: Context) {
      * Wrapped in a timeout by the caller; the temp file is always deleted even on failure so the
      * cache can't grow unbounded across a long-running session.
      */
-    suspend fun playDuckedAudio(wavBytes: ByteArray) {
+    suspend fun playDuckedAudio(wavBytes: ByteArray, volume: Float = 1.0f) {
         val file = File(context.cacheDir, "dj_line_${System.currentTimeMillis()}.wav")
         try {
             file.writeBytes(wavBytes)
             Log.d(TAG, "Step 4b: wrote ${wavBytes.size} bytes to ${file.name}")
-            playDuckedLine(file)
+            playDuckedLine(file, volume)
         } finally {
             if (file.exists() && !file.delete()) {
                 Log.w(TAG, "Could not delete temp audio ${file.name}")
@@ -73,7 +73,7 @@ class AudioPlaybackManager(private val context: Context) {
      *    the request only *notifies* Spotify, which then ramps its own volume down. Starting
      *    instantly meant the DJ's first word landed over full-volume music.
      */
-    suspend fun playDuckedLine(file: File) {
+    suspend fun playDuckedLine(file: File, volume: Float = 1.0f) {
         val granted = requestDuckingFocus()
         Log.d(TAG, "Step 5a: audio focus ${if (granted) "GRANTED" else "DENIED (playing anyway)"}")
         // Let Spotify's volume ramp complete before the first word. Skipped if focus was denied,
@@ -81,7 +81,7 @@ class AudioPlaybackManager(private val context: Context) {
         if (granted) delay(DUCK_SETTLE_MS)
 
         try {
-            awaitPlayback(file)
+            awaitPlayback(file, volume)
         } finally {
             // Focus is abandoned here, after playback has genuinely finished (or failed, or been
             // cancelled) - never earlier, so music can't come back up mid-sentence.
@@ -90,7 +90,7 @@ class AudioPlaybackManager(private val context: Context) {
         }
     }
 
-    private suspend fun awaitPlayback(file: File) = suspendCancellableCoroutine<Unit> { cont ->
+    private suspend fun awaitPlayback(file: File, volume: Float = 1.0f) = suspendCancellableCoroutine<Unit> { cont ->
         // Defensive: release any player left over from a cancelled previous segment before
         // overwriting the field, which would otherwise leak it.
         exoPlayer?.release()
@@ -114,6 +114,9 @@ class AudioPlaybackManager(private val context: Context) {
             }
         })
 
+        // ExoPlayer volume caps at 1.0, so this can only attenuate - the real loudness gain comes
+        // from normalising the PCM in GeminiClient before it ever reaches here.
+        player.volume = volume.coerceIn(0f, 1f)
         player.setMediaItem(MediaItem.fromUri(file.toURI().toString()))
         player.prepare()
         player.playWhenReady = true

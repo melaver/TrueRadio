@@ -46,6 +46,8 @@ class SecureSettings(private val context: Context) {
         val TUNED_GENRE_OVERRIDE = stringPreferencesKey("tuned_genre_override")
         val DJ_EVERY_N_TRACKS = stringPreferencesKey("dj_every_n_tracks")
         val VOICE_MODE = stringPreferencesKey("voice_mode")
+        val NEWS_LENGTH = stringPreferencesKey("news_length")
+        val DJ_VOLUME = stringPreferencesKey("dj_volume")
         val SCRIPT_CACHE = stringPreferencesKey("script_cache")
         val EVERGREEN_LINES = stringPreferencesKey("evergreen_lines")
         val ARTIST_LIST_CACHE = stringPreferencesKey("artist_list_cache")
@@ -97,6 +99,13 @@ class SecureSettings(private val context: Context) {
     }
     val voiceMode: Flow<VoiceMode> = context.dataStore.data.map { prefs ->
         VoiceMode.entries.firstOrNull { it.name == prefs[Keys.VOICE_MODE] } ?: VoiceMode.BALANCED
+    }
+    val newsLength: Flow<NewsLength> = context.dataStore.data.map { prefs ->
+        NewsLength.entries.firstOrNull { it.name == prefs[Keys.NEWS_LENGTH] } ?: NewsLength.STANDARD
+    }
+    /** Extra gain applied to DJ playback, 0.5x-1.5x. Stacks on top of audio normalisation. */
+    val djVolume: Flow<Float> = context.dataStore.data.map { prefs ->
+        prefs[Keys.DJ_VOLUME]?.toFloatOrNull()?.coerceIn(0.5f, 1.5f) ?: 1.0f
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -235,6 +244,14 @@ class SecureSettings(private val context: Context) {
         }.toMap().toMutableMap()
     }
 
+    suspend fun saveNewsLength(length: NewsLength) {
+        context.dataStore.edit { prefs -> prefs[Keys.NEWS_LENGTH] = length.name }
+    }
+
+    suspend fun saveDjVolume(volume: Float) {
+        context.dataStore.edit { prefs -> prefs[Keys.DJ_VOLUME] = volume.coerceIn(0.5f, 1.5f).toString() }
+    }
+
     suspend fun saveVoiceMode(mode: VoiceMode) {
         context.dataStore.edit { prefs -> prefs[Keys.VOICE_MODE] = mode.name }
     }
@@ -270,4 +287,6 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotSongLanguages(): Set<SongLanguage> = songLanguages.first()
     suspend fun snapshotDjEveryNTracks(): Int = djEveryNTracks.first()
     suspend fun snapshotVoiceMode(): VoiceMode = voiceMode.first()
+    suspend fun snapshotNewsLength(): NewsLength = newsLength.first()
+    suspend fun snapshotDjVolume(): Float = djVolume.first()
 }

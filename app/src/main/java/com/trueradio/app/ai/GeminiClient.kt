@@ -156,8 +156,12 @@ class GeminiClient(
         """.trimIndent()
     }
 
-    private fun hourlyNewsPrompt(headlines: List<String>, likedTopics: List<String>): String {
-        val headlineBlock = headlines.take(5).joinToString("\n") { "- $it" }
+    private fun hourlyNewsPrompt(
+        headlines: List<String>,
+        likedTopics: List<String>,
+        lengthHint: String = "About three short sentences."
+    ): String {
+        val headlineBlock = headlines.joinToString("\n") { "- $it" }
         val preferenceNote = if (likedTopics.isNotEmpty()) {
             "\nThe listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
                 "If any headline touches those, give it a little more weight and detail."
@@ -169,6 +173,7 @@ class GeminiClient(
             $headlineBlock
             $preferenceNote
 
+            Length: $lengthHint
             Summarise in a sharp broadcast voice - don't read them out one by one like a list.
         """.trimIndent()
     }
@@ -335,8 +340,11 @@ class GeminiClient(
         }
     }
 
-    suspend fun generateHourlyNews(headlines: List<String>, likedTopics: List<String> = emptyList()): Result<String> =
-        generateScript(hourlyNewsPrompt(headlines, likedTopics))
+    suspend fun generateHourlyNews(
+        headlines: List<String>,
+        likedTopics: List<String> = emptyList(),
+        lengthHint: String = "About three short sentences."
+    ): Result<String> = generateScript(hourlyNewsPrompt(headlines, likedTopics, lengthHint))
 
     /**
      * Generates a bank of reusable generic station lines in ONE call. Played at random between
@@ -536,7 +544,7 @@ class GeminiClient(
                     return@withContext Result.failure(IOException("Gemini TTS returned empty audio"))
                 }
                 Log.d(TAG, "TTS produced ${pcm.size} PCM bytes, wrapping as WAV")
-                Result.success(pcmToWav(pcm))
+                Result.success(pcmToWav(normalizePcm(pcm)))
             }
         } catch (e: java.io.IOException) {
             Log.e(TAG, "TTS network error", e)
@@ -552,6 +560,52 @@ class GeminiClient(
      * players (ExoPlayer, MediaPlayer) can decode it. Without this the bytes are unplayable and
      * ExoPlayer cannot infer a format - typically producing silence with a confusing error.
      */
+    /**
+     * Peak-normalises 16-bit PCM so the DJ sits at a comparable level to music.
+     *
+     * Gemini TTS returns speech well below full scale, which is correct for a voice file but
+     * leaves the DJ noticeably quieter than Spotify - especially since ducking only lowers the
+     * music partway. Normalising here, before the WAV header is written, is cleaner than fighting
+     * it at playback: ExoPlayer's volume caps at 1.0 so it can't boost, and a LoudnessEnhancer
+     * effect would need an audio session and extra lifecycle handling for the same result.
+     *
+     * [headroomDb] leaves a little margin below 0 dBFS so peaks don't clip after resampling.
+     */
+    private fun normalizePcm(pcm: ByteArray, headroomDb: Double = -1.0): ByteArray {
+        if (pcm.size < 2) return pcm
+
+        // Find the peak sample (little-endian signed 16-bit).
+        var peak = 0
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
+            val magnitude = kotlin.math.abs(sample)
+            if (magnitude > peak) peak = magnitude
+            i += 2
+        }
+        if (peak == 0) return pcm // silence; nothing to scale
+
+        val target = 32767.0 * Math.pow(10.0, headroomDb / 20.0)
+        val gain = target / peak
+        // Don't amplify noise floors on already-loud audio, and don't attenuate.
+        if (gain <= 1.0 || gain > 8.0) {
+            Log.d(TAG, "Skipping normalisation (gain would be ${"%.2f".format(gain)})")
+            return pcm
+        }
+        Log.d(TAG, "Normalising DJ audio by ${"%.2f".format(gain)}x (peak was $peak)")
+
+        val out = ByteArray(pcm.size)
+        i = 0
+        while (i + 1 < pcm.size) {
+            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
+            val scaled = (sample * gain).toInt().coerceIn(-32768, 32767)
+            out[i] = (scaled and 0xFF).toByte()
+            out[i + 1] = ((scaled shr 8) and 0xFF).toByte()
+            i += 2
+        }
+        return out
+    }
+
     private fun pcmToWav(pcm: ByteArray): ByteArray {
         val byteRate = TTS_SAMPLE_RATE * TTS_CHANNELS * TTS_BITS_PER_SAMPLE / 8
         val blockAlign = TTS_CHANNELS * TTS_BITS_PER_SAMPLE / 8
