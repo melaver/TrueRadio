@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.trueradio.app.tts.CloudTtsClient
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -48,6 +49,8 @@ class SecureSettings(private val context: Context) {
         val VOICE_MODE = stringPreferencesKey("voice_mode")
         val NEWS_LENGTH = stringPreferencesKey("news_length")
         val DJ_VOLUME = stringPreferencesKey("dj_volume")
+        val CLOUD_TTS_KEY = stringPreferencesKey("cloud_tts_key")
+        val CLOUD_TTS_VOICE = stringPreferencesKey("cloud_tts_voice")
         val SCRIPT_CACHE = stringPreferencesKey("script_cache")
         val EVERGREEN_LINES = stringPreferencesKey("evergreen_lines")
         val ARTIST_LIST_CACHE = stringPreferencesKey("artist_list_cache")
@@ -106,6 +109,10 @@ class SecureSettings(private val context: Context) {
     /** Extra gain applied to DJ playback, 0.5x-1.5x. Stacks on top of audio normalisation. */
     val djVolume: Flow<Float> = context.dataStore.data.map { prefs ->
         prefs[Keys.DJ_VOLUME]?.toFloatOrNull()?.coerceIn(0.5f, 1.5f) ?: 1.0f
+    }
+    val cloudTtsKey: Flow<String> = context.dataStore.data.map { it[Keys.CLOUD_TTS_KEY] ?: "" }
+    val cloudTtsVoice: Flow<String> = context.dataStore.data.map {
+        it[Keys.CLOUD_TTS_VOICE] ?: CloudTtsClient.DEFAULT_VOICE
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -244,6 +251,14 @@ class SecureSettings(private val context: Context) {
         }.toMap().toMutableMap()
     }
 
+    suspend fun saveCloudTtsKey(key: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.CLOUD_TTS_KEY] = key.trim() }
+    }
+
+    suspend fun saveCloudTtsVoice(voice: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.CLOUD_TTS_VOICE] = voice }
+    }
+
     suspend fun saveNewsLength(length: NewsLength) {
         context.dataStore.edit { prefs -> prefs[Keys.NEWS_LENGTH] = length.name }
     }
@@ -288,5 +303,7 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotDjEveryNTracks(): Int = djEveryNTracks.first()
     suspend fun snapshotVoiceMode(): VoiceMode = voiceMode.first()
     suspend fun snapshotNewsLength(): NewsLength = newsLength.first()
+    suspend fun snapshotCloudTtsKey(): String = cloudTtsKey.first()
+    suspend fun snapshotCloudTtsVoice(): String = cloudTtsVoice.first()
     suspend fun snapshotDjVolume(): Float = djVolume.first()
 }

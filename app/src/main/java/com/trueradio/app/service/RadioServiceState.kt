@@ -47,6 +47,11 @@ object RadioServiceState {
     val isRateLimited: StateFlow<Boolean> = _isRateLimited.asStateFlow()
     internal fun setRateLimited(limited: Boolean) { _isRateLimited.value = limited }
 
+    /** True when repeated 429s suggest the daily quota is gone, not just a momentary burst. */
+    private val _dailyQuotaExhausted = MutableStateFlow(false)
+    val dailyQuotaExhausted: StateFlow<Boolean> = _dailyQuotaExhausted.asStateFlow()
+    internal fun setDailyQuotaExhausted(v: Boolean) { _dailyQuotaExhausted.value = v }
+
     internal fun setRunning(running: Boolean) {
         _isRunning.value = running
         if (!running) {

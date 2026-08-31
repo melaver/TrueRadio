@@ -20,19 +20,10 @@ import kotlin.random.Random
 
 /**
  * Owns both halves of the DJ's voice:
- *  1. Script generation (text) via a general Flash model, using the persona prompts below.
- *  2. Speech generation (audio) via Gemini's dedicated TTS model.
+ * Script generation only. Speech is handled by CloudTtsClient - Gemini's TTS models are
+ * preview-only with limits this app kept exhausting, whereas Cloud TTS is a separate product with
+ * a large permanent free allowance. Splitting them keeps Gemini on the cheap, batchable half.
  *
- * WHY TWO CALLS, NOT ONE: Gemini's native audio output only exists on dedicated TTS models
- * (currently `gemini-3.1-flash-tts-preview`). Those models *read text aloud* - they don't author
- * creative copy, so asking one to invent witty radio trivia produces poor scripts. Google's own
- * speech-generation docs use exactly this two-step shape (creative model writes, TTS model
- * voices). General Flash models do NOT accept `responseModalities: ["AUDIO"]`.
- *
- * WHY THE AUDIO NEEDS POST-PROCESSING: the TTS response is base64 **raw PCM** (signed 16-bit
- * little-endian, 24 kHz, mono) - not a container format. Handing those bytes straight to
- * ExoPlayer fails silently (it can't infer a format), an easy "no audio, no error" bug.
- * [pcmToWav] prepends a 44-byte RIFF/WAVE header so the result is a real playable .wav.
  */
 class GeminiClient(
     private val apiKey: String,
@@ -74,12 +65,51 @@ class GeminiClient(
          */
         @Volatile
         private var rateLimitedUntilMs = 0L
-        private const val RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000L
+        @Volatile
+        private var consecutiveTrips = 0
+        @Volatile
+        private var lastTripAtMs = 0L
+
+        /**
+         * Escalating cooldowns. A fixed 5-minute pause works for a burst (per-minute) limit, but
+         * if the DAILY quota is exhausted the very next call after the cooldown fails again -
+         * an endless 429-wait-429 loop that never recovers and keeps burning failed requests.
+         * Backing off further each time a trip recurs quickly turns that loop into a few attempts
+         * spread over hours, which is the only sane behaviour against a daily cap.
+         */
+        private val COOLDOWN_LADDER_MS = longArrayOf(
+            5 * 60 * 1000L,    // first trip: assume a burst limit
+            15 * 60 * 1000L,
+            60 * 60 * 1000L,
+            3 * 60 * 60 * 1000L // repeated trips: almost certainly a daily cap
+        )
+        /** A trip this soon after the last one means the previous cooldown didn't help. */
+        private const val ESCALATE_WINDOW_MS = 10 * 60 * 1000L
 
         fun isRateLimited(): Boolean = System.currentTimeMillis() < rateLimitedUntilMs
         fun rateLimitSecondsRemaining(): Long =
             ((rateLimitedUntilMs - System.currentTimeMillis()) / 1000).coerceAtLeast(0)
-        private fun tripRateLimit() { rateLimitedUntilMs = System.currentTimeMillis() + RATE_LIMIT_COOLDOWN_MS }
+
+        /** True once cooldowns have escalated past the burst-limit assumption. */
+        fun isLikelyDailyQuotaExhausted(): Boolean = consecutiveTrips >= 2
+
+        private fun tripRateLimit() {
+            val now = System.currentTimeMillis()
+            consecutiveTrips = if (now - lastTripAtMs < rateLimitedUntilMs - lastTripAtMs + ESCALATE_WINDOW_MS) {
+                (consecutiveTrips + 1).coerceAtMost(COOLDOWN_LADDER_MS.size - 1)
+            } else {
+                0
+            }
+            lastTripAtMs = now
+            rateLimitedUntilMs = now + COOLDOWN_LADDER_MS[consecutiveTrips]
+        }
+
+        /** Called after any success, so a recovered quota returns to short cooldowns. */
+        private fun noteSuccess() {
+            if (consecutiveTrips != 0 && System.currentTimeMillis() - lastTripAtMs > ESCALATE_WINDOW_MS) {
+                consecutiveTrips = 0
+            }
+        }
 
         /**
          * Rolling alias Google maintains pointing at their current recommended Flash model, used
@@ -89,13 +119,6 @@ class GeminiClient(
          */
         private const val TEXT_MODEL = "gemini-flash-latest"
 
-        /**
-         * Dedicated TTS model. NOTE: unlike TEXT_MODEL there is no rolling "-latest" alias for
-         * TTS, so this IS a pinned preview id and WILL eventually need updating - if DJ audio
-         * starts failing with a 404 while text scripts still work, this constant is the first
-         * thing to check against ai.google.dev/gemini-api/docs/speech-generation.
-         */
-        private const val TTS_MODEL = "gemini-3.1-flash-tts-preview"
 
         private const val ENDPOINT_TEMPLATE =
             "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
@@ -112,10 +135,6 @@ class GeminiClient(
         // Retrying it just consumes more quota.
         private val RETRYABLE_CODES = setOf(500, 502, 503, 504)
 
-        // Gemini TTS output format, fixed by the API contract - used to build the WAV header.
-        private const val TTS_SAMPLE_RATE = 24_000
-        private const val TTS_CHANNELS = 1
-        private const val TTS_BITS_PER_SAMPLE = 16
 
         private val ENGLISH_PERSONA = """
             You are a sharp, witty, warm radio host in the style of BBC Radio 6 Music or KCRW.
@@ -130,74 +149,13 @@ class GeminiClient(
             5. Length: about three short sentences, no more.
         """.trimIndent()
 
-        /**
-         * Prebuilt Gemini voice per language. Both are warm mid-range voices suited to a radio
-         * read; the full roster (Zephyr, Kore, Charon, Puck, Aoede, ...) is in Google's TTS docs.
-         * Gemini TTS models are multilingual, so the same voice can speak Hebrew or English - the
-         * language comes from the script text, not the voice id.
-         */
-        fun voiceFor(language: DjLanguage): String = "Charon"
-    }
-
-    private fun persona(): String = ENGLISH_PERSONA
-
-    // ---------------------------------------------------------------- prompts
-
-    private fun trackTransitionPrompt(currentArtist: String, currentTitle: String, nextTitle: String?): String {
-        val nextPart = if (nextTitle != null) "The next track is \"$nextTitle\"." else "The next track is coming up."
-        return """
-            ${persona()}
-
-            Task: write a short radio transition between songs.
-            Just played: "$currentTitle" by $currentArtist.
-            $nextPart
-            Work in a witty piece of trivia or surprising background about the artist or track,
-            then lead smoothly into what's next.
-        """.trimIndent()
-    }
-
-    private fun hourlyNewsPrompt(
-        headlines: List<String>,
-        likedTopics: List<String>,
-        lengthHint: String = "About three short sentences."
-    ): String {
-        val headlineBlock = headlines.joinToString("\n") { "- $it" }
-        val preferenceNote = if (likedTopics.isNotEmpty()) {
-            "\nThe listener has flagged special interest in: ${likedTopics.joinToString(", ")}. " +
-                "If any headline touches those, give it a little more weight and detail."
-        } else ""
-        return """
-            ${persona()}
-
-            Task: write a short, energetic top-of-the-hour news update from these headlines:
-            $headlineBlock
-            $preferenceNote
-
-            Length: $lengthHint
-            Summarise in a sharp broadcast voice - don't read them out one by one like a list.
-        """.trimIndent()
-    }
-
-    // ---------------------------------------------------------------- request plumbing
-
-    /**
-     * Executes [block] with exponential backoff on transient failures. Retries only on the codes
-     * in [RETRYABLE_CODES] plus raw network errors - a 400 (bad request) or 404 (model retired)
-     * would fail identically every time, so retrying those just wastes the listener's time and
-     * delays the fallback.
-     *
-     * Backoff includes jitter so that if several DJ segments fail at once they don't all retry in
-     * lockstep and hit the overloaded backend at the same instant.
-     */
-    private suspend fun <T> withRetries(label: String, block: suspend () -> Result<T>): Result<T> {
-        if (isRateLimited()) {
-            Log.w(TAG, "[$label] skipped - rate limited for another ${rateLimitSecondsRemaining()}s")
-            return Result.failure(IOException("Gemini rate limited (${rateLimitSecondsRemaining()}s remaining)"))
-        }
         var lastFailure: Throwable? = null
         repeat(MAX_ATTEMPTS) { attempt ->
             val result = block()
-            if (result.isSuccess) return result
+            if (result.isSuccess) {
+                noteSuccess()
+                return result
+            }
 
             val error = result.exceptionOrNull()
             lastFailure = error
@@ -205,7 +163,8 @@ class GeminiClient(
             // further calls, otherwise the retries deepen the hole.
             if (error?.message?.contains("429") == true) {
                 tripRateLimit()
-                Log.e(TAG, "[$label] RATE LIMITED (429) - pausing all Gemini calls for 5 minutes")
+                Log.e(TAG, "[$label] RATE LIMITED (429) - pausing all Gemini calls for ${rateLimitSecondsRemaining() / 60} minutes" +
+                    if (isLikelyDailyQuotaExhausted()) " (repeated trips suggest the DAILY quota is exhausted)" else "")
                 return Result.failure(error)
             }
             val retryable = (error as? RetryableHttpException) != null
@@ -481,161 +440,5 @@ class GeminiClient(
             .distinct()
             .take(count)
 
-    // ---------------------------------------------------------------- speech generation
 
-    /**
-     * Synthesizes [text] to speech via Gemini's TTS model and returns ready-to-play WAV bytes
-     * (PCM already wrapped in a RIFF header - see the class doc). Returns failure on any error so
-     * the caller can fall back to on-device TTS rather than leaving music ducked forever.
-     */
-    suspend fun synthesizeSpeech(text: String): Result<ByteArray> =
-        withRetries("tts") { synthesizeSpeechOnce(text) }
-
-    private suspend fun synthesizeSpeechOnce(text: String): Result<ByteArray> = withContext(Dispatchers.IO) {
-        try {
-            val payload = JSONObject().apply {
-                put(
-                    "contents", JSONArray().put(
-                        JSONObject().put("parts", JSONArray().put(JSONObject().put("text", text)))
-                    )
-                )
-                put("generationConfig", JSONObject().apply {
-                    put("responseModalities", JSONArray().put("AUDIO"))
-                    put(
-                        "speechConfig", JSONObject().put(
-                            "voiceConfig", JSONObject().put(
-                                "prebuiltVoiceConfig", JSONObject().put("voiceName", voiceFor(language))
-                            )
-                        )
-                    )
-                })
-            }
-            val request = Request.Builder()
-                .url(ENDPOINT_TEMPLATE.format(TTS_MODEL))
-                .addHeader("x-goog-api-key", apiKey)
-                .post(payload.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    // A 404 here while text still works almost certainly means TTS_MODEL has been
-                    // retired - see the constant's comment.
-                    Log.e(TAG, "TTS failed: HTTP ${response.code} - ${body.take(400)}")
-                    val msg = "Gemini TTS error ${response.code}"
-                    return@withContext Result.failure(
-                        if (response.code in RETRYABLE_CODES) RetryableHttpException(msg) else IOException(msg)
-                    )
-                }
-                val base64Audio = JSONObject(body)
-                    .optJSONArray("candidates")?.optJSONObject(0)
-                    ?.optJSONObject("content")
-                    ?.optJSONArray("parts")?.optJSONObject(0)
-                    ?.optJSONObject("inlineData")
-                    ?.optString("data")
-                    ?.takeIf { it.isNotBlank() }
-                if (base64Audio == null) {
-                    Log.e(TAG, "TTS returned no inlineData. Body: ${body.take(400)}")
-                    return@withContext Result.failure(IOException("Gemini TTS returned no audio"))
-                }
-
-                val pcm = Base64.decode(base64Audio, Base64.DEFAULT)
-                if (pcm.isEmpty()) {
-                    return@withContext Result.failure(IOException("Gemini TTS returned empty audio"))
-                }
-                Log.d(TAG, "TTS produced ${pcm.size} PCM bytes, wrapping as WAV")
-                Result.success(pcmToWav(normalizePcm(pcm)))
-            }
-        } catch (e: java.io.IOException) {
-            Log.e(TAG, "TTS network error", e)
-            Result.failure(RetryableHttpException(e.message ?: "network error"))
-        } catch (e: Exception) {
-            Log.e(TAG, "TTS threw", e)
-            Result.failure(e)
-        }
-    }
-
-    /**
-     * Wraps raw signed-16-bit little-endian mono PCM in a 44-byte RIFF/WAVE header so standard
-     * players (ExoPlayer, MediaPlayer) can decode it. Without this the bytes are unplayable and
-     * ExoPlayer cannot infer a format - typically producing silence with a confusing error.
-     */
-    /**
-     * Peak-normalises 16-bit PCM so the DJ sits at a comparable level to music.
-     *
-     * Gemini TTS returns speech well below full scale, which is correct for a voice file but
-     * leaves the DJ noticeably quieter than Spotify - especially since ducking only lowers the
-     * music partway. Normalising here, before the WAV header is written, is cleaner than fighting
-     * it at playback: ExoPlayer's volume caps at 1.0 so it can't boost, and a LoudnessEnhancer
-     * effect would need an audio session and extra lifecycle handling for the same result.
-     *
-     * [headroomDb] leaves a little margin below 0 dBFS so peaks don't clip after resampling.
-     */
-    private fun normalizePcm(pcm: ByteArray, headroomDb: Double = -1.0): ByteArray {
-        if (pcm.size < 2) return pcm
-
-        // Find the peak sample (little-endian signed 16-bit).
-        var peak = 0
-        var i = 0
-        while (i + 1 < pcm.size) {
-            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
-            val magnitude = kotlin.math.abs(sample)
-            if (magnitude > peak) peak = magnitude
-            i += 2
-        }
-        if (peak == 0) return pcm // silence; nothing to scale
-
-        val target = 32767.0 * Math.pow(10.0, headroomDb / 20.0)
-        val gain = target / peak
-        // Don't amplify noise floors on already-loud audio, and don't attenuate.
-        if (gain <= 1.0 || gain > 8.0) {
-            Log.d(TAG, "Skipping normalisation (gain would be ${"%.2f".format(gain)})")
-            return pcm
-        }
-        Log.d(TAG, "Normalising DJ audio by ${"%.2f".format(gain)}x (peak was $peak)")
-
-        val out = ByteArray(pcm.size)
-        i = 0
-        while (i + 1 < pcm.size) {
-            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)).toShort().toInt()
-            val scaled = (sample * gain).toInt().coerceIn(-32768, 32767)
-            out[i] = (scaled and 0xFF).toByte()
-            out[i + 1] = ((scaled shr 8) and 0xFF).toByte()
-            i += 2
-        }
-        return out
-    }
-
-    private fun pcmToWav(pcm: ByteArray): ByteArray {
-        val byteRate = TTS_SAMPLE_RATE * TTS_CHANNELS * TTS_BITS_PER_SAMPLE / 8
-        val blockAlign = TTS_CHANNELS * TTS_BITS_PER_SAMPLE / 8
-        val out = ByteArrayOutputStream(44 + pcm.size)
-
-        fun writeAscii(s: String) = out.write(s.toByteArray(Charsets.US_ASCII))
-        fun writeIntLE(v: Int) = out.write(
-            byteArrayOf(
-                (v and 0xff).toByte(),
-                ((v shr 8) and 0xff).toByte(),
-                ((v shr 16) and 0xff).toByte(),
-                ((v shr 24) and 0xff).toByte()
-            )
-        )
-        fun writeShortLE(v: Int) = out.write(byteArrayOf((v and 0xff).toByte(), ((v shr 8) and 0xff).toByte()))
-
-        writeAscii("RIFF")
-        writeIntLE(36 + pcm.size)   // chunk size = header remainder + payload
-        writeAscii("WAVE")
-        writeAscii("fmt ")
-        writeIntLE(16)              // PCM subchunk size
-        writeShortLE(1)             // audio format 1 = PCM
-        writeShortLE(TTS_CHANNELS)
-        writeIntLE(TTS_SAMPLE_RATE)
-        writeIntLE(byteRate)
-        writeShortLE(blockAlign)
-        writeShortLE(TTS_BITS_PER_SAMPLE)
-        writeAscii("data")
-        writeIntLE(pcm.size)
-        out.write(pcm)
-        return out.toByteArray()
-    }
 }

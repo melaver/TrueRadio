@@ -67,6 +67,7 @@ fun DashboardScreen(
     val daySegment by RadioServiceState.daySegment.collectAsState()
     val currentGenre by RadioServiceState.currentGenre.collectAsState()
     val isRateLimited by RadioServiceState.isRateLimited.collectAsState()
+    val dailyQuotaExhausted by RadioServiceState.dailyQuotaExhausted.collectAsState()
 
     val spotifyClientId by settings.spotifyClientId.collectAsState(initial = "")
     val geminiKey by settings.geminiApiKey.collectAsState(initial = "")
@@ -177,7 +178,12 @@ fun DashboardScreen(
                 Spacer(Modifier.height(12.dp))
                 AssistChip(
                     onClick = onOpenSettings,
-                    label = { Text("Gemini rate limited - DJ using offline voice") }
+                    label = {
+                        Text(
+                            if (dailyQuotaExhausted) "Gemini daily quota used up - DJ in offline mode"
+                            else "Gemini busy - DJ using offline voice"
+                        )
+                    }
                 )
             }
 

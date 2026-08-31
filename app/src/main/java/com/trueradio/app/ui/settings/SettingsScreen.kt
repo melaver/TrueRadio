@@ -16,6 +16,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.DaySegment
 import com.trueradio.app.NewsLength
+import com.trueradio.app.tts.CloudTtsClient
 import com.trueradio.app.VoiceMode
 import com.trueradio.app.GenreAnchors
 import com.trueradio.app.NewsCategory
@@ -52,6 +53,8 @@ fun SettingsScreen(
     val voiceMode by settings.voiceMode.collectAsState(initial = VoiceMode.BALANCED)
     val newsLength by settings.newsLength.collectAsState(initial = NewsLength.STANDARD)
     val djVolume by settings.djVolume.collectAsState(initial = 1.0f)
+    val savedCloudKey by settings.cloudTtsKey.collectAsState(initial = "")
+    val cloudTtsVoice by settings.cloudTtsVoice.collectAsState(initial = CloudTtsClient.DEFAULT_VOICE)
     val segmentGenres by settings.segmentGenres.collectAsState(initial = SegmentGenres())
     val newsPrefs by settings.newsPreferences.collectAsState(initial = NewsPreferences())
     val genreAnchors by settings.genreAnchors.collectAsState(initial = GenreAnchors())
@@ -67,6 +70,7 @@ fun SettingsScreen(
     var newSourceName by rememberSaveable { mutableStateOf("") }
     var newSourceUrl by rememberSaveable { mutableStateOf("") }
     var showKeys by rememberSaveable { mutableStateOf(false) }
+    var cloudTtsKey by remember(savedCloudKey) { mutableStateOf(savedCloudKey) }
 
     Scaffold(
         topBar = {

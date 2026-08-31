@@ -23,6 +23,7 @@ import com.trueradio.app.spotify.HourlyMixEngine
 import com.trueradio.app.spotify.SpotifyManager
 import com.trueradio.app.spotify.SpotifyWebApiClient
 import com.trueradio.app.spotify.SpotifyWebAuthManager
+import com.trueradio.app.tts.CloudTtsClient
 import com.trueradio.app.tts.LocalTtsFallback
 import com.trueradio.app.ui.MainActivity
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -102,6 +103,8 @@ class RadioForegroundService : LifecycleService() {
     private var spotifyManager: SpotifyManager? = null
     private var geminiClient: GeminiClient? = null
     private var localTts: LocalTtsFallback? = null
+    private var cloudTts: CloudTtsClient? = null
+    private var cloudTtsVoice: String = CloudTtsClient.DEFAULT_VOICE
     private var djLanguage: DjLanguage = DjLanguage.ENGLISH
     private lateinit var newsRepository: NewsRepository
     private lateinit var audioPlaybackManager: AudioPlaybackManager
@@ -292,6 +295,12 @@ class RadioForegroundService : LifecycleService() {
         geminiClient = GeminiClient(geminiKey, djLanguage)
         localTts = LocalTtsFallback(applicationContext)
 
+        // Speech comes from Cloud TTS (separate, far larger quota); Gemini only writes scripts.
+        val cloudKey = settings.snapshotCloudTtsKey()
+        cloudTtsVoice = settings.snapshotCloudTtsVoice()
+        cloudTts = if (cloudKey.isNotBlank()) CloudTtsClient(cloudKey) else null
+        Log.d(DJ_TAG, "Cloud TTS ${if (cloudTts != null) "enabled (voice=$cloudTtsVoice)" else "not configured - using device voice"}")
+
         // Seed caches from disk: the mix is built from the user's top artists, so the same tracks
         // recur constantly and previously-written scripts are almost always reusable.
         scriptCache.putAll(settings.loadScriptCache())
@@ -411,6 +420,7 @@ class RadioForegroundService : LifecycleService() {
                 if (lastKnownIsPaused) continue // only count time the music is actually playing
 
                 RadioServiceState.setRateLimited(GeminiClient.isRateLimited())
+                RadioServiceState.setDailyQuotaExhausted(GeminiClient.isLikelyDailyQuotaExhausted())
                 playbackMsSinceNews += PLAYBACK_TICK_MS
                 if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
                     maybeTriggerNewsFlash()
@@ -541,7 +551,13 @@ class RadioForegroundService : LifecycleService() {
                     Log.d(DJ_TAG, "Step 0: script ready, skipping Gemini TTS (mode=$voiceMode)")
                     return@launch
                 }
-                val wav = gemini.synthesizeSpeech(script).getOrElse {
+                val tts = cloudTts
+                if (tts == null) {
+                    scriptCache["${track.artist}|${track.title}"] = script
+                    Log.d(DJ_TAG, "Step 0: script ready, no Cloud TTS configured")
+                    return@launch
+                }
+                val wav = tts.synthesize(script, cloudTtsVoice).getOrElse {
                     Log.w(DJ_TAG, "Step 0: prefetch TTS failed (${it.message}) - will retry live at the boundary")
                     return@launch
                 }
@@ -731,13 +747,25 @@ class RadioForegroundService : LifecycleService() {
             updateStatus("News fetch failed: ${it.message}")
             return
         }
+        // Headlines are already in hand from RSS - if Gemini can't summarise them, read them
+        // directly rather than dropping the bulletin. No AI needed for a news read to be useful.
+        if (GeminiClient.isRateLimited()) {
+            Log.w(DJ_TAG, "News: Gemini unavailable, reading headlines directly")
+            updateStatus("News (headline mode)")
+            speakLine(templatedNewsScript(headlines), label = "News flash")
+            return
+        }
+
         val scriptResult = gemini.generateHourlyNews(
             headlines,
             likedTopics = preferences.likedTopics,
             lengthHint = newsLength.promptHint
         )
         val script = scriptResult.getOrElse {
-            updateStatus("News script generation failed: ${it.message}")
+            // Same reasoning as the rate-limit branch above: we already have the headlines.
+            Log.w(DJ_TAG, "News script failed (${it.message}) - reading headlines directly")
+            updateStatus("News (headline mode)")
+            speakLine(templatedNewsScript(headlines), label = "News flash")
             return
         }
         speakLine(script, label = "News flash")
@@ -812,6 +840,21 @@ class RadioForegroundService : LifecycleService() {
      * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
      * rate limit meant the segment was dropped entirely and the radio just went quiet.
      */
+    /**
+     * Reads the fetched headlines with a fixed intro. Used whenever Gemini is unavailable - the
+     * RSS feed already gave us the actual news, so the bulletin still carries real information;
+     * only the witty summarising is lost.
+     */
+    private fun templatedNewsScript(headlines: List<String>): String {
+        val intro = "Top of the hour. Here's what's happening."
+        val body = headlines.take(4).joinToString(" ") { headline ->
+            // Ensure each headline ends with a full stop so TTS doesn't run them together.
+            if (headline.endsWith(".") || headline.endsWith("!") || headline.endsWith("?")) headline
+            else "$headline."
+        }
+        return "$intro $body That's your update."
+    }
+
     private val genreChangeTemplates = listOf(
         "Switching things up - some %s coming your way.",
         "Let's change the mood. %s from here.",
@@ -908,12 +951,16 @@ class RadioForegroundService : LifecycleService() {
         updateStatus("$label: speaking...")
 
         try {
-            val wav = if (!useGeminiVoice(label)) {
-                Log.d(DJ_TAG, "Step 3: [$label] using on-device voice (mode=$voiceMode) - no Gemini TTS call")
+            val wav = if (!useGeminiVoice(label) || cloudTts == null) {
+                if (cloudTts == null) {
+                    Log.d(DJ_TAG, "Step 3: [$label] no Cloud TTS key - using device voice")
+                } else {
+                    Log.d(DJ_TAG, "Step 3: [$label] using on-device voice (mode=$voiceMode)")
+                }
                 null
             } else {
                 withTimeoutOrNull(SPEECH_TIMEOUT_MS) {
-                    gemini?.synthesizeSpeech(script)?.getOrNull()
+                    cloudTts?.synthesize(script, cloudTtsVoice)?.getOrNull()
                 }
             }
 
