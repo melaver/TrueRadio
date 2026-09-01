@@ -518,12 +518,16 @@ class RadioForegroundService : LifecycleService() {
 
         // Respect the DJ frequency setting - nothing was prepared for skipped tracks.
         if (tracksSinceDj < djEveryNTracks) return
-        tracksSinceDj = 0
 
         if (!speakingMutex.tryLock()) {
             Log.d(DJ_TAG, "Step 1: boundary hit for '${track.title}' but DJ busy - skipping this one")
             return
         }
+
+        // Reset ONLY after winning the mutex. Resetting before the lock meant a boundary that
+        // collided with a news flash both lost its segment and restarted the counter, so the DJ
+        // then stayed silent for another full N tracks - two penalties for one collision.
+        tracksSinceDj = 0
 
         Log.d(DJ_TAG, "Step 1: DETECTED boundary - '${track.artist} - ${track.title}', ${remaining}ms remaining")
         lifecycleScope.launch {

@@ -14,7 +14,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.SecureSettings
-import com.trueradio.app.ai.GeminiClient
 import com.trueradio.app.service.RadioServiceState
 
 /**
