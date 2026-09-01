@@ -667,7 +667,7 @@ class RadioForegroundService : LifecycleService() {
 
                 updateStatus("Remixing $genre...")
                 Log.d(TAG, "Remix #$remixCount for genre '$genre'")
-                val uri = engine.buildAndPublishMixForGenre(genre, variation = remixCount)
+                val uri = engine.buildAndPublishMixForGenre(genre, variation = remixCount, segment = segment)
                     .getOrElse {
                         Log.e(TAG, "Remix failed", it)
                         updateStatus("Remix failed: ${it.message}")
@@ -816,7 +816,7 @@ class RadioForegroundService : LifecycleService() {
         consumedScriptKeys.clear()
 
         updateStatus("Building $genre mix for this hour...")
-        val playlistUriResult = engine.buildAndPublishMixForGenre(genre)
+        val playlistUriResult = engine.buildAndPublishMixForGenre(genre, segment = segment)
         val playlistUri = playlistUriResult.getOrElse {
             updateStatus("Genre mix build failed: ${it.message}")
             return

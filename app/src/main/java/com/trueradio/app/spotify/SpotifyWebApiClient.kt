@@ -107,6 +107,26 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
     }
 
     /**
+     * Looks up a single artist by name and returns their Spotify metadata, including genre tags.
+     *
+     * Used to VERIFY Gemini's artist suggestions rather than trusting them: the model is asked for
+     * artists in a genre, but whether an artist actually carries that genre tag is a fact only
+     * Spotify can settle. Checking here is what stops the discovery tier drifting off-genre.
+     */
+    suspend fun searchArtistByName(name: String): Result<SpotifyArtist?> = withContext(Dispatchers.IO) {
+        runCatching {
+            val sanitized = name.replace("\"", "")
+            val query = java.net.URLEncoder.encode("artist:\"$sanitized\"", "UTF-8")
+            val request = authedRequest("https://api.spotify.com/v1/search?q=$query&type=artist&limit=1")
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Artist lookup failed: ${response.code}")
+                val artists = JSONObject(response.body?.string().orEmpty()).getJSONObject("artists")
+                parseArtists(artists.getJSONArray("items")).firstOrNull()
+            }
+        }
+    }
+
+    /**
      * Searches an artist's catalog directly via general search rather than the now-removed
      * `GET /artists/{id}/top-tracks` endpoint. Used to pull *more* tracks from an artist the user
      * already listens to (beyond whatever happened to land in their top-tracks snapshot), which

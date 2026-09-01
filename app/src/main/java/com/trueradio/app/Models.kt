@@ -435,6 +435,21 @@ enum class DjLanguage(val displayName: String) {
     ENGLISH("English")
 }
 
+/**
+ * How strictly the mix is confined to the selected genre.
+ *
+ * These two goals genuinely conflict: the more strictly a mix is confined to one genre, the less
+ * of the listener's own library qualifies for it, and vice versa. Rather than pick for the user,
+ * this exposes the trade-off.
+ */
+enum class GenreStrictness(val displayName: String, val description: String) {
+    /** Only tracks by artists tagged with the target genre. Never drifts; may be thinner. */
+    STRICT("Strict", "Only artists tagged with this genre - never drifts"),
+
+    /** Prefers genre-matching material but fills gaps from your library. Can drift. */
+    RELAXED("Relaxed", "Fills gaps from your library, even off-genre")
+}
+
 /** How long the top-of-the-hour news read should be. */
 enum class NewsLength(val displayName: String, val headlineCount: Int, val promptHint: String) {
     BRIEF("Brief", 3, "Keep it to two short sentences - just the essentials."),

@@ -51,6 +51,7 @@ class SecureSettings(private val context: Context) {
         val DJ_VOLUME = stringPreferencesKey("dj_volume")
         val CLOUD_TTS_KEY = stringPreferencesKey("cloud_tts_key")
         val CLOUD_TTS_VOICE = stringPreferencesKey("cloud_tts_voice")
+        val GENRE_STRICTNESS = stringPreferencesKey("genre_strictness")
         val SCRIPT_CACHE = stringPreferencesKey("script_cache")
         val EVERGREEN_LINES = stringPreferencesKey("evergreen_lines")
         val ARTIST_LIST_CACHE = stringPreferencesKey("artist_list_cache")
@@ -113,6 +114,9 @@ class SecureSettings(private val context: Context) {
     val cloudTtsKey: Flow<String> = context.dataStore.data.map { it[Keys.CLOUD_TTS_KEY] ?: "" }
     val cloudTtsVoice: Flow<String> = context.dataStore.data.map {
         it[Keys.CLOUD_TTS_VOICE] ?: CloudTtsClient.DEFAULT_VOICE
+    }
+    val genreStrictness: Flow<GenreStrictness> = context.dataStore.data.map { prefs ->
+        GenreStrictness.entries.firstOrNull { it.name == prefs[Keys.GENRE_STRICTNESS] } ?: GenreStrictness.STRICT
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -251,6 +255,10 @@ class SecureSettings(private val context: Context) {
         }.toMap().toMutableMap()
     }
 
+    suspend fun saveGenreStrictness(strictness: GenreStrictness) {
+        context.dataStore.edit { prefs -> prefs[Keys.GENRE_STRICTNESS] = strictness.name }
+    }
+
     suspend fun saveCloudTtsKey(key: String) {
         context.dataStore.edit { prefs -> prefs[Keys.CLOUD_TTS_KEY] = key.trim() }
     }
@@ -304,6 +312,7 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotVoiceMode(): VoiceMode = voiceMode.first()
     suspend fun snapshotNewsLength(): NewsLength = newsLength.first()
     suspend fun snapshotCloudTtsKey(): String = cloudTtsKey.first()
+    suspend fun snapshotGenreStrictness(): GenreStrictness = genreStrictness.first()
     suspend fun snapshotCloudTtsVoice(): String = cloudTtsVoice.first()
     suspend fun snapshotDjVolume(): Float = djVolume.first()
 }

@@ -15,6 +15,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.trueradio.app.DaySegment
+import com.trueradio.app.GenreStrictness
 import com.trueradio.app.NewsLength
 import com.trueradio.app.tts.CloudTtsClient
 import com.trueradio.app.VoiceMode
@@ -52,6 +53,7 @@ fun SettingsScreen(
     val themeMode by settings.themeMode.collectAsState(initial = ThemeMode.SYSTEM)
     val voiceMode by settings.voiceMode.collectAsState(initial = VoiceMode.BALANCED)
     val newsLength by settings.newsLength.collectAsState(initial = NewsLength.STANDARD)
+    val genreStrictness by settings.genreStrictness.collectAsState(initial = GenreStrictness.STRICT)
     val djVolume by settings.djVolume.collectAsState(initial = 1.0f)
     val savedCloudKey by settings.cloudTtsKey.collectAsState(initial = "")
     val cloudTtsVoice by settings.cloudTtsVoice.collectAsState(initial = CloudTtsClient.DEFAULT_VOICE)
@@ -146,6 +148,25 @@ fun SettingsScreen(
                     scope.launch { settings.saveSongLanguages(updated) }
                 },
                 label = { it.displayName }
+            )
+
+            HorizontalDivider()
+            SectionHeader(
+                "Genre strictness",
+                "Strict keeps every track inside the selected genre, but the mix may be shorter " +
+                    "if little of your library matches. Relaxed fills the gap from your library " +
+                    "even when it's off-genre."
+            )
+            SingleChoiceChipGrid(
+                options = GenreStrictness.entries.toList(),
+                selected = genreStrictness,
+                onSelect = { scope.launch { settings.saveGenreStrictness(it) } },
+                label = { it.displayName }
+            )
+            Text(
+                genreStrictness.description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             HorizontalDivider()

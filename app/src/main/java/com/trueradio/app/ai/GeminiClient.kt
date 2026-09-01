@@ -413,11 +413,12 @@ class GeminiClient(
         seedArtists: List<String>,
         genre: String,
         count: Int = 8,
-        songLanguage: String? = null
+        songLanguage: String? = null,
+        moodHint: String? = null
     ): Result<List<String>> {
         if (seedArtists.isEmpty()) return Result.success(emptyList())
 
-        val cacheKey = "similar:${genre.lowercase()}:${songLanguage ?: "any"}:" +
+        val cacheKey = "similar:${genre.lowercase()}:${moodHint ?: ""}:${songLanguage ?: "any"}:" +
             seedArtists.take(5).joinToString(",").lowercase()
         artistListCache[cacheKey]?.let {
             Log.d(TAG, "Using cached similar artists for '$genre'")
@@ -427,16 +428,26 @@ class GeminiClient(
         val languageRule = songLanguage?.let {
             "\n            - CRITICAL: only artists who primarily perform in $it."
         } ?: ""
+        val moodRule = moodHint?.let { "\n            - Favour artists whose work fits this mood: $it." } ?: ""
         val prompt = """
-            You are a music recommendation engine. A listener's favourite artists include:
+            You are a music recommendation engine.
+
+            TARGET GENRE: $genre
+            This is the single most important constraint. Every artist you suggest must be one that
+            a music database would genuinely tag as "$genre" - not merely adjacent to it, not a
+            crossover act better known for something else, and not an artist the listener's
+            favourites happen to resemble in some other genre.
+
+            The listener's favourite $genre artists include:
             ${seedArtists.take(12).joinToString(", ")}
 
-            Suggest exactly $count OTHER artists in or adjacent to the "$genre" genre that this
-            listener would likely enjoy, based on the sound, era and sensibility of those artists.
+            Suggest exactly $count OTHER artists working in $genre that this listener would likely
+            enjoy, based on the sound, era and sensibility of the artists above.
 
             Hard rules:
+            - EVERY suggestion must be primarily a $genre artist. If unsure, leave it out.
             - Do NOT include any artist already listed above.
-            - Only suggest real, existing recording artists.$languageRule
+            - Only suggest real, existing recording artists.$moodRule$languageRule
             - Output ONLY the artist names, one per line. No numbering, no commentary, no blank lines.
         """.trimIndent()
 
