@@ -164,6 +164,8 @@ class RadioForegroundService : LifecycleService() {
 
     private var preparedTrackUri: String? = null
     private var preparedAudio: ByteArray? = null
+    /** Text of [preparedAudio], kept so prefetched segments still reach the history log. */
+    private var preparedScript: String? = null
     private var prefetchJob: Job? = null
 
     /** Tracks played since the DJ last spoke, compared against the user's DJ frequency setting. */
@@ -387,11 +389,13 @@ class RadioForegroundService : LifecycleService() {
                     Log.d(DJ_TAG, "Next segment is evergreen - skipping prefetch")
                     preparedAudio = null
                     preparedTrackUri = null
+                    preparedScript = null
                 }
             } else {
                 Log.d(DJ_TAG, "Skipping DJ for this track ($tracksSinceDj/$djEveryNTracks)")
                 preparedAudio = null
                 preparedTrackUri = null
+                preparedScript = null
             }
         }
 
@@ -558,6 +562,7 @@ class RadioForegroundService : LifecycleService() {
         prefetchJob?.cancel() // a new track supersedes any in-flight prefetch for the old one
         preparedTrackUri = null
         preparedAudio = null
+        preparedScript = null
 
         val gemini = geminiClient ?: return
         prefetchJob = lifecycleScope.launch {
@@ -594,6 +599,7 @@ class RadioForegroundService : LifecycleService() {
                 }
                 preparedTrackUri = track.uri
                 preparedAudio = wav
+                preparedScript = script
                 Log.d(DJ_TAG, "Step 0: PREFETCH READY (${wav.size} bytes) for '${track.title}'")
             } catch (e: Exception) {
                 Log.e(DJ_TAG, "Step 0: prefetch threw", e)
@@ -904,9 +910,11 @@ class RadioForegroundService : LifecycleService() {
         val prepared = preparedAudio?.takeIf { preparedTrackUri == track.uri }
         if (prepared != null) {
             Log.d(DJ_TAG, "Step 2: using PREFETCHED audio for '${track.title}'")
+            val preparedText = preparedScript
             preparedAudio = null
             preparedTrackUri = null
-            playPreparedAudio(prepared, label = "Trivia")
+            preparedScript = null
+            playPreparedAudio(prepared, label = "Trivia", script = preparedText)
             return
         }
         segmentCounter++
@@ -938,18 +946,11 @@ class RadioForegroundService : LifecycleService() {
         speakLine(script, label = "Trivia")
     }
 
-    /**
-     * Full DJ speech path: Gemini TTS -> ducked WAV playback, with on-device TTS as fallback.
-     *
-     * Every stage is logged and time-boxed. The hard timeout matters more than it looks: if a
-     * synthesis or playback call hangs, audio focus stays held and Spotify stays ducked
-     * indefinitely - the music would sit quiet forever with no error. Bailing out and letting
-     * music continue is always better than a stuck DJ.
-     */
     /** Plays already-synthesized audio, reusing the same ducking + telemetry path as speakLine. */
-    private suspend fun playPreparedAudio(wav: ByteArray, label: String) {
+    private suspend fun playPreparedAudio(wav: ByteArray, label: String, script: String? = null) {
         updateStatus("$label: speaking...")
-        RadioServiceState.addHistory(isDjLine = true, text = script)
+        // Prefetched audio arrives without its text unless the caller passes it along.
+        script?.let { RadioServiceState.addHistory(isDjLine = true, text = it) }
         try {
             val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
                 audioPlaybackManager.playDuckedAudio(wav, settings.snapshotDjVolume())
