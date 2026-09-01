@@ -65,6 +65,9 @@ class RadioForegroundService : LifecycleService() {
         const val ACTION_REMIX = "com.trueradio.app.action.REMIX"
         /** Debug/manual: read the news flash immediately, resetting the 20-minute timer. */
         const val ACTION_FORCE_NEWS = "com.trueradio.app.action.FORCE_NEWS"
+        /** Sets or clears the sleep timer; minutes in EXTRA_SLEEP_MINUTES (0 = cancel). */
+        const val ACTION_SET_SLEEP_TIMER = "com.trueradio.app.action.SET_SLEEP_TIMER"
+        const val EXTRA_SLEEP_MINUTES = "extra_sleep_minutes"
         const val EXTRA_SPOTIFY_CLIENT_ID = "extra_spotify_client_id"
         private const val NOTIFICATION_ID = 42
         private const val TRIVIA_TRIGGER_WINDOW_MS = 15_000L
@@ -168,6 +171,9 @@ class RadioForegroundService : LifecycleService() {
     private var djEveryNTracks = 2
     private var voiceMode: VoiceMode = VoiceMode.BALANCED
 
+    /** Wall-clock time the radio should stop, or 0 when no sleep timer is set. */
+    private var sleepAtMs = 0L
+
     private var remixCount = 0
     /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
     private var isRemixing = false
@@ -242,6 +248,10 @@ class RadioForegroundService : LifecycleService() {
             }
             ACTION_REMIX -> {
                 remixCurrentMix()
+                return START_STICKY
+            }
+            ACTION_SET_SLEEP_TIMER -> {
+                setSleepTimer(intent.getIntExtra(EXTRA_SLEEP_MINUTES, 0))
                 return START_STICKY
             }
             ACTION_FORCE_NEWS -> {
@@ -386,6 +396,7 @@ class RadioForegroundService : LifecycleService() {
         }
 
         updateNotification("${track.artist} - ${track.title}", track.isPaused)
+        if (isNewTrack) RadioServiceState.addHistory(isDjLine = false, text = "${track.artist} - ${track.title}")
 
         if (speakingMutex.isLocked || track.isPaused) return
         maybeTriggerGenreSwitch()
@@ -417,7 +428,23 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             while (isActive) {
                 delay(PLAYBACK_TICK_MS)
-                if (lastKnownIsPaused) continue // only count time the music is actually playing
+                // Sleep timer is checked BEFORE the paused guard: it's a wall-clock promise to
+                // stop, so pausing and walking away must still shut the radio down rather than
+                // leaving the service running indefinitely with a frozen timer.
+                if (sleepAtMs > 0L) {
+                    val remainingMs = sleepAtMs - System.currentTimeMillis()
+                    if (remainingMs <= 0L) {
+                        Log.d(TAG, "Sleep timer elapsed - stopping radio")
+                        sleepAtMs = 0L
+                        RadioServiceState.setSleepMinutesRemaining(null)
+                        spotifyManager?.pause()
+                        stopSelf()
+                        return@launch
+                    }
+                    RadioServiceState.setSleepMinutesRemaining((remainingMs / 60_000).toInt() + 1)
+                }
+
+                if (lastKnownIsPaused) continue // only count playback time for everything below
 
                 RadioServiceState.setRateLimited(GeminiClient.isRateLimited())
                 RadioServiceState.setDailyQuotaExhausted(GeminiClient.isLikelyDailyQuotaExhausted())
@@ -918,6 +945,7 @@ class RadioForegroundService : LifecycleService() {
     /** Plays already-synthesized audio, reusing the same ducking + telemetry path as speakLine. */
     private suspend fun playPreparedAudio(wav: ByteArray, label: String) {
         updateStatus("$label: speaking...")
+        RadioServiceState.addHistory(isDjLine = true, text = script)
         try {
             val played = withTimeoutOrNull(PLAYBACK_TIMEOUT_MS) {
                 audioPlaybackManager.playDuckedAudio(wav, settings.snapshotDjVolume())
@@ -1007,6 +1035,18 @@ class RadioForegroundService : LifecycleService() {
                 val current = settings.snapshotTrackFeedback()
                 val updated = if (liked) current.withLike(verdict) else current.withDislike(verdict)
                 settings.saveTrackFeedback(updated)
+
+                // Also save to Spotify's Liked Songs. Saved tracks are Tier 1 of the mix engine,
+                // so a thumbs-up now feeds back into future playlists rather than only living in
+                // local storage where Spotify never sees it.
+                if (liked) {
+                    val webAuth = spotifyWebAuthManager
+                    if (webAuth != null && webAuth.isConnected()) {
+                        SpotifyWebApiClient(webAuth).saveTrackToLibrary(track.uri)
+                            .onSuccess { Log.d(TAG, "Saved '${track.title}' to Spotify library") }
+                            .onFailure { Log.w(TAG, "Could not save to Spotify library: ${it.message}") }
+                    }
+                }
                 Log.d(TAG, "Recorded ${if (liked) "LIKE" else "DISLIKE"} for ${track.artist} - ${track.title}")
                 updateStatus(if (liked) "Liked ${track.title}" else "Disliked ${track.title} - skipping")
                 if (!liked) spotifyManager?.skipNext()
@@ -1014,6 +1054,21 @@ class RadioForegroundService : LifecycleService() {
                 Log.e(TAG, "Failed to record feedback", e)
             }
         }
+    }
+
+    /** Sets the sleep timer; [minutes] of 0 or less cancels it. */
+    private fun setSleepTimer(minutes: Int) {
+        if (minutes <= 0) {
+            sleepAtMs = 0L
+            RadioServiceState.setSleepMinutesRemaining(null)
+            updateStatus("Sleep timer cancelled")
+            Log.d(TAG, "Sleep timer cancelled")
+            return
+        }
+        sleepAtMs = System.currentTimeMillis() + minutes * 60_000L
+        RadioServiceState.setSleepMinutesRemaining(minutes)
+        updateStatus("Sleep timer: ${minutes}m")
+        Log.d(TAG, "Sleep timer set for $minutes minutes")
     }
 
     private fun togglePlayback() {

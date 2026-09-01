@@ -14,12 +14,16 @@ import androidx.navigation.compose.rememberNavController
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.ui.dashboard.DashboardScreen
 import com.trueradio.app.ui.onboarding.OnboardingFlow
+import com.trueradio.app.ui.settings.HealthCheckScreen
+import com.trueradio.app.ui.settings.HistoryScreen
 import com.trueradio.app.ui.settings.SettingsScreen
 
 object Routes {
     const val ONBOARDING = "onboarding"
     const val DASHBOARD = "dashboard"
     const val SETTINGS = "settings"
+    const val HISTORY = "history"
+    const val HEALTH = "health"
 }
 
 /**
@@ -41,7 +45,8 @@ fun TrueRadioNavHost(
     onDislike: () -> Unit,
     onForceDj: () -> Unit,
     onRemix: () -> Unit,
-    onForceNews: () -> Unit
+    onForceNews: () -> Unit,
+    onSetSleepTimer: (Int) -> Unit
 ) {
     // null = still loading; avoids rendering a start destination we might have to change.
     val onboardingComplete by produceState<Boolean?>(initialValue = null) {
@@ -99,6 +104,21 @@ fun TrueRadioNavHost(
                 onConnectSpotifyWeb = onConnectSpotifyWeb,
                 onDisconnectSpotifyWeb = onDisconnectSpotifyWeb,
                 onForceDj = onForceDj,
+                onSetSleepTimer = onSetSleepTimer,
+                onOpenHistory = { navController.navigate(Routes.HISTORY) },
+                onOpenHealth = { navController.navigate(Routes.HEALTH) },
+                onBack = { navController.popBackStack() }
+            )
+        }
+
+        composable(Routes.HISTORY) {
+            HistoryScreen(onBack = { navController.popBackStack() })
+        }
+
+        composable(Routes.HEALTH) {
+            HealthCheckScreen(
+                settings = settings,
+                isSpotifyWebConnected = isSpotifyWebConnected,
                 onBack = { navController.popBackStack() }
             )
         }

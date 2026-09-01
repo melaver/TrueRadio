@@ -178,6 +178,34 @@ class SpotifyWebApiClient(private val authManager: SpotifyWebAuthManager) {
     }
 
     /**
+     * Saves a track to the user's Liked Songs.
+     *
+     * Closes the feedback loop: saved tracks are Tier 1 of the mix engine, so a thumbs-up now
+     * strengthens future mixes through the strongest signal available, instead of only being
+     * recorded locally where Spotify never sees it.
+     *
+     * NOTE: the February 2026 migration moved library writes from `PUT /me/tracks` to
+     * `PUT /me/library`; the old path returns 403 for current clients.
+     */
+    suspend fun saveTrackToLibrary(trackUri: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val token = authManager.getValidAccessToken().getOrThrow()
+            // The library endpoint takes bare ids, not full spotify:track: URIs.
+            val id = trackUri.substringAfterLast(":")
+            val payload = JSONObject().put("ids", JSONArray().put(id))
+            val body = payload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url("https://api.spotify.com/v1/me/library")
+                .addHeader("Authorization", "Bearer $token")
+                .put(body)
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("Save to library failed: ${response.code}")
+            }
+        }
+    }
+
+    /**
      * Creates a new private playlist for the current user and returns its id. Call once and
      * persist the id; reuse via [replacePlaylistTracks]. Uses `POST /me/playlists` (the
      * February-2026-current endpoint) rather than the removed `POST /users/{user_id}/playlists`,

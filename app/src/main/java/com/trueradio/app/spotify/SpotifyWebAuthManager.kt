@@ -62,6 +62,8 @@ class SpotifyWebAuthManager(
             // Saved/"Liked Songs" - a deliberate signal (you chose to save it) rather than a
             // merely-frequent one, so it's weighted above top-tracks in the mix.
             "user-library-read",
+            // Lets a thumbs-up save the track to Liked Songs, which feeds Tier 1 of the mix.
+            "user-library-modify",
             "playlist-modify-private",
             "playlist-read-private",
             "user-read-private"

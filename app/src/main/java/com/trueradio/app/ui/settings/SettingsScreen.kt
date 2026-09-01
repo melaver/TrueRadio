@@ -26,6 +26,8 @@ import com.trueradio.app.NewsSource
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.SegmentGenres
 import com.trueradio.app.SongLanguage
+import com.trueradio.app.alarm.WakeAlarmReceiver
+import com.trueradio.app.service.RadioForegroundService
 import com.trueradio.app.service.RadioServiceState
 import com.trueradio.app.ThemeMode
 import com.trueradio.app.ui.components.LikedArtistsEditor
@@ -44,6 +46,9 @@ fun SettingsScreen(
     onConnectSpotifyWeb: (String) -> Unit,
     onDisconnectSpotifyWeb: () -> Unit,
     onForceDj: () -> Unit,
+    onSetSleepTimer: (Int) -> Unit,
+    onOpenHistory: () -> Unit,
+    onOpenHealth: () -> Unit,
     onBack: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -54,6 +59,10 @@ fun SettingsScreen(
     val voiceMode by settings.voiceMode.collectAsState(initial = VoiceMode.BALANCED)
     val newsLength by settings.newsLength.collectAsState(initial = NewsLength.STANDARD)
     val genreStrictness by settings.genreStrictness.collectAsState(initial = GenreStrictness.STRICT)
+    val sleepMinutes by RadioServiceState.sleepMinutesRemaining.collectAsState()
+    val wakeAlarm by settings.wakeAlarmMinutes.collectAsState(initial = null)
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var alarmScheduled by rememberSaveable { mutableStateOf(true) }
     val djVolume by settings.djVolume.collectAsState(initial = 1.0f)
     val savedCloudKey by settings.cloudTtsKey.collectAsState(initial = "")
     val cloudTtsVoice by settings.cloudTtsVoice.collectAsState(initial = CloudTtsClient.DEFAULT_VOICE)
@@ -149,6 +158,61 @@ fun SettingsScreen(
                 },
                 label = { it.displayName }
             )
+
+            HorizontalDivider()
+            SectionHeader("Sleep timer", "Stops the radio after a set time, even if paused.")
+            SingleChoiceChipGrid(
+                options = listOf(0, 15, 30, 45, 60, 90),
+                selected = sleepMinutes ?: 0,
+                onSelect = { mins -> onSetSleepTimer(mins) },
+                label = { if (it == 0) "Off" else "$it min" }
+            )
+            sleepMinutes?.let {
+                Text(
+                    "Stopping in about $it minute${if (it == 1) "" else "s"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            HorizontalDivider()
+            SectionHeader(
+                "Wake to radio",
+                "Starts the radio at this time with a morning mix and the news."
+            )
+            SingleChoiceChipGrid(
+                options = listOf(-1, 360, 390, 420, 450, 480),
+                selected = wakeAlarm ?: -1,
+                onSelect = { mins ->
+                    scope.launch {
+                        if (mins < 0) {
+                            settings.saveWakeAlarmMinutes(null)
+                            WakeAlarmReceiver.cancel(context)
+                        } else {
+                            settings.saveWakeAlarmMinutes(mins)
+                            alarmScheduled = WakeAlarmReceiver.schedule(context, mins)
+                        }
+                    }
+                },
+                label = { if (it < 0) "Off" else "%02d:%02d".format(it / 60, it % 60) }
+            )
+            if (wakeAlarm != null && !alarmScheduled) {
+                Text(
+                    "Android is blocking exact alarms. Enable Alarms & reminders for TrueRadio in " +
+                        "system settings, or the wake time may be delayed.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
+            HorizontalDivider()
+            SectionHeader("Diagnostics")
+            OutlinedButton(onClick = onOpenHealth, modifier = Modifier.fillMaxWidth()) {
+                Text("Setup check")
+            }
+            OutlinedButton(onClick = onOpenHistory, modifier = Modifier.fillMaxWidth()) {
+                Text("History - tracks & DJ lines")
+            }
 
             HorizontalDivider()
             SectionHeader(

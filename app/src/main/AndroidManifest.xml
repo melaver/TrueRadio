@@ -12,6 +12,11 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Wake-to-radio alarm. SCHEDULE_EXACT_ALARM is needed because an inexact alarm can be
+         deferred by many minutes under Doze, which defeats the purpose of an alarm clock. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+
     <!-- Required so the app can see/launch the Spotify app on Android 11+ -->
     <queries>
         <package android:name="com.spotify.music" />
@@ -50,6 +55,10 @@
             android:name="com.spotify.sdk.android.auth.LoginActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <receiver
+            android:name=".alarm.WakeAlarmReceiver"
+            android:exported="false" />
 
         <service
             android:name=".service.RadioForegroundService"

@@ -74,7 +74,8 @@ class MainActivity : ComponentActivity() {
                         onDislike = { sendServiceAction(RadioForegroundService.ACTION_DISLIKE) },
                         onForceDj = { sendServiceAction(RadioForegroundService.ACTION_FORCE_DJ) },
                         onRemix = { sendServiceAction(RadioForegroundService.ACTION_REMIX) },
-                        onForceNews = { sendServiceAction(RadioForegroundService.ACTION_FORCE_NEWS) }
+                        onForceNews = { sendServiceAction(RadioForegroundService.ACTION_FORCE_NEWS) },
+                        onSetSleepTimer = { minutes -> setSleepTimer(minutes) }
                     )
                 }
             }
@@ -197,6 +198,18 @@ class MainActivity : ComponentActivity() {
             return
         }
         startService(Intent(this, RadioForegroundService::class.java).apply { this.action = action })
+    }
+
+    /** Sleep timer only makes sense while the radio is live; 0 cancels. */
+    private fun setSleepTimer(minutes: Int) {
+        if (!RadioServiceState.isRunning.value) {
+            Log.d(TAG, "Sleep timer ignored - service isn't running")
+            return
+        }
+        startService(Intent(this, RadioForegroundService::class.java).apply {
+            action = RadioForegroundService.ACTION_SET_SLEEP_TIMER
+            putExtra(RadioForegroundService.EXTRA_SLEEP_MINUTES, minutes)
+        })
     }
 
     private fun stopDjService() {

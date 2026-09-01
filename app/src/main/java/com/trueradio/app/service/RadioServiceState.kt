@@ -20,6 +20,9 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 object RadioServiceState {
 
+    private const val MAX_HISTORY = 200
+
+
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
@@ -51,6 +54,33 @@ object RadioServiceState {
     private val _dailyQuotaExhausted = MutableStateFlow(false)
     val dailyQuotaExhausted: StateFlow<Boolean> = _dailyQuotaExhausted.asStateFlow()
     internal fun setDailyQuotaExhausted(v: Boolean) { _dailyQuotaExhausted.value = v }
+
+    /**
+     * Rolling log of what played and what the DJ said. Exists because spoken content is
+     * otherwise unrecoverable - if the DJ mentions something interesting while you're driving,
+     * there's no way back to it. Capped so a long session can't grow memory unbounded.
+     */
+    data class HistoryEntry(
+        val timestampMs: Long,
+        val isDjLine: Boolean,
+        val text: String
+    )
+
+    private val _history = MutableStateFlow<List<HistoryEntry>>(emptyList())
+    val history: StateFlow<List<HistoryEntry>> = _history.asStateFlow()
+
+    internal fun addHistory(isDjLine: Boolean, text: String) {
+        if (text.isBlank()) return
+        val entry = HistoryEntry(System.currentTimeMillis(), isDjLine, text)
+        // Skip consecutive duplicates - PlayerState can report the same track repeatedly.
+        if (_history.value.firstOrNull()?.text == text) return
+        _history.value = (listOf(entry) + _history.value).take(MAX_HISTORY)
+    }
+
+    /** Minutes remaining on the sleep timer, or null when no timer is set. */
+    private val _sleepMinutesRemaining = MutableStateFlow<Int?>(null)
+    val sleepMinutesRemaining: StateFlow<Int?> = _sleepMinutesRemaining.asStateFlow()
+    internal fun setSleepMinutesRemaining(v: Int?) { _sleepMinutesRemaining.value = v }
 
     internal fun setRunning(running: Boolean) {
         _isRunning.value = running

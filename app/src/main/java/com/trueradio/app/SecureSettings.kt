@@ -52,6 +52,7 @@ class SecureSettings(private val context: Context) {
         val CLOUD_TTS_KEY = stringPreferencesKey("cloud_tts_key")
         val CLOUD_TTS_VOICE = stringPreferencesKey("cloud_tts_voice")
         val GENRE_STRICTNESS = stringPreferencesKey("genre_strictness")
+        val WAKE_ALARM_MINUTES = stringPreferencesKey("wake_alarm_minutes")
         val SCRIPT_CACHE = stringPreferencesKey("script_cache")
         val EVERGREEN_LINES = stringPreferencesKey("evergreen_lines")
         val ARTIST_LIST_CACHE = stringPreferencesKey("artist_list_cache")
@@ -117,6 +118,10 @@ class SecureSettings(private val context: Context) {
     }
     val genreStrictness: Flow<GenreStrictness> = context.dataStore.data.map { prefs ->
         GenreStrictness.entries.firstOrNull { it.name == prefs[Keys.GENRE_STRICTNESS] } ?: GenreStrictness.STRICT
+    }
+    /** Minutes past midnight for the wake alarm, or null when disabled. */
+    val wakeAlarmMinutes: Flow<Int?> = context.dataStore.data.map {
+        it[Keys.WAKE_ALARM_MINUTES]?.toIntOrNull()
     }
     val onboardingComplete: Flow<Boolean> = context.dataStore.data.map { it[Keys.ONBOARDING_COMPLETE] == "true" }
 
@@ -255,6 +260,13 @@ class SecureSettings(private val context: Context) {
         }.toMap().toMutableMap()
     }
 
+    suspend fun saveWakeAlarmMinutes(minutes: Int?) {
+        context.dataStore.edit { prefs ->
+            if (minutes == null) prefs.remove(Keys.WAKE_ALARM_MINUTES)
+            else prefs[Keys.WAKE_ALARM_MINUTES] = minutes.toString()
+        }
+    }
+
     suspend fun saveGenreStrictness(strictness: GenreStrictness) {
         context.dataStore.edit { prefs -> prefs[Keys.GENRE_STRICTNESS] = strictness.name }
     }
@@ -313,6 +325,7 @@ class SecureSettings(private val context: Context) {
     suspend fun snapshotNewsLength(): NewsLength = newsLength.first()
     suspend fun snapshotCloudTtsKey(): String = cloudTtsKey.first()
     suspend fun snapshotGenreStrictness(): GenreStrictness = genreStrictness.first()
+    suspend fun snapshotWakeAlarmMinutes(): Int? = wakeAlarmMinutes.first()
     suspend fun snapshotCloudTtsVoice(): String = cloudTtsVoice.first()
     suspend fun snapshotDjVolume(): Float = djVolume.first()
 }
