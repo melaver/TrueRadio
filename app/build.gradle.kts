@@ -94,16 +94,12 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Networking (OkHttp) for Gemini / ElevenLabs / RSS / Spotify Web API
+    // Networking (OkHttp) for Gemini / Cloud TTS / RSS / Spotify Web API
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
 
     // XML/RSS parsing
     implementation("org.jsoup:jsoup:1.17.2") // tolerant XML/HTML parsing used for RSS
-
-    // Gson: used directly by GeminiClient and TtsManager (request/response JSON), not just as
-    // converter-gson's transitive dependency - declared explicitly rather than relying on that.
-    implementation("com.google.code.gson:gson:2.11.0")
 
     // Media3 / ExoPlayer for local ducked TTS playback
     implementation("androidx.media3:media3-exoplayer:1.4.0")

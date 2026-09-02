@@ -99,12 +99,6 @@ class HourlyMixEngine(
     }
 
     /**
-     * The one verification used by every tier: does Spotify tag this artist with the target genre?
-     *
-     * [knownTags] lets callers skip the network lookup when tags are already in hand (top artists
-     * arrive with theirs attached), so verification is free for the tiers built from them.
-     */
-    /**
      * Result of a genre check. UNKNOWN is distinct from NO because callers must be able to treat
      * "we couldn't find out" differently from "we checked and it doesn't match" - conflating them
      * meant an exhausted lookup budget silently rejected every remaining candidate and produced an
@@ -112,6 +106,12 @@ class HourlyMixEngine(
      */
     private enum class GenreVerdict { YES, NO, UNKNOWN }
 
+    /**
+     * The one verification used by every tier: does Spotify tag this artist with the target genre?
+     *
+     * [knownTags] lets callers skip the network lookup when tags are already in hand (top artists
+     * arrive with theirs attached), so verification is free for the tiers built from them.
+     */
     private suspend fun verifyArtistGenre(
         artistName: String,
         genreLower: String,

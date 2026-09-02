@@ -149,6 +149,35 @@ fun SettingsScreen(
 
             HorizontalDivider()
             SectionHeader(
+                "Cloud TTS voice",
+                "Powers the premium voice selected above. Needs its own API key from Google Cloud " +
+                    "Console (enable the Text-to-Speech API) - separate from the Gemini key below, " +
+                    "with its own large free monthly allowance. Without one, the DJ always uses " +
+                    "your device's built-in voice regardless of the mode chosen above."
+            )
+            OutlinedTextField(
+                value = cloudTtsKey,
+                onValueChange = { cloudTtsKey = it },
+                label = { Text("Cloud TTS API Key") },
+                supportingText = { Text("From console.cloud.google.com/apis/credentials") },
+                visualTransformation = if (showKeys) androidx.compose.ui.text.input.VisualTransformation.None
+                else PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Button(
+                onClick = { scope.launch { settings.saveCloudTtsKey(cloudTtsKey) } },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Save Cloud TTS key") }
+            SingleChoiceChipGrid(
+                options = CloudTtsClient.VOICE_OPTIONS.map { it.first },
+                selected = cloudTtsVoice,
+                onSelect = { voiceId -> scope.launch { settings.saveCloudTtsVoice(voiceId) } },
+                label = { voiceId -> CloudTtsClient.VOICE_OPTIONS.firstOrNull { it.first == voiceId }?.second ?: voiceId }
+            )
+
+            HorizontalDivider()
+            SectionHeader(
                 "Song languages",
                 "Pick any number. Biases artist selection toward these languages - Spotify has no " +
                     "language field, so it can't be exact, and your own saved/top tracks are never " +

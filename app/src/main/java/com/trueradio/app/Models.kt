@@ -254,15 +254,7 @@ data class TrackFeedback(
     val liked: List<TrackVerdict> = emptyList(),
     val disliked: List<TrackVerdict> = emptyList()
 ) {
-    val likedUris: Set<String> get() = liked.map { it.uri }.toSet()
     val dislikedUris: Set<String> get() = disliked.map { it.uri }.toSet()
-
-    /** Artists with at least one like, most-liked first - used as extra seeds for the mix. */
-    fun favouriteArtists(): List<String> =
-        liked.groupingBy { it.artist }.eachCount()
-            .entries.sortedByDescending { it.value }
-            .map { it.key }
-            .filter { it.isNotBlank() }
 
     /**
      * Artists disliked [threshold]+ times, excluded from the mix entirely. Requires more than one
@@ -363,7 +355,6 @@ data class GenreAnchors(
         const val GLOBAL_KEY = "__global__"
         const val MAX_PER_GENRE = 5
         const val MAX_GLOBAL = 20
-        const val RECOMMENDED_MIN = 3
 
         fun deserialize(blob: String): GenreAnchors {
             if (blob.isBlank()) return GenreAnchors()
@@ -481,12 +472,3 @@ enum class VoiceMode(val displayName: String, val description: String) {
 enum class ThemeMode {
     LIGHT, DARK, SYSTEM
 }
-
-/** High-level state the UI observes. */
-data class DjUiState(
-    val isConnectedToSpotify: Boolean = false,
-    val isServiceRunning: Boolean = false,
-    val currentTrack: TrackInfo? = null,
-    val lastDjLine: String = "",
-    val statusMessage: String = "Idle"
-)

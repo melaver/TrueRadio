@@ -61,8 +61,6 @@ class SecureSettings(private val context: Context) {
     val spotifyClientId: Flow<String> = context.dataStore.data.map { it[Keys.SPOTIFY_CLIENT_ID] ?: "" }
     val geminiApiKey: Flow<String> = context.dataStore.data.map { it[Keys.GEMINI_API_KEY] ?: "" }
 
-    val newsCategoriesCsv: Flow<String> = context.dataStore.data.map { it[Keys.NEWS_CATEGORIES] ?: NewsCategory.GENERAL.name }
-    val newsLikedTopicsCsv: Flow<String> = context.dataStore.data.map { it[Keys.NEWS_LIKED_TOPICS] ?: "" }
     val newsPreferences: Flow<NewsPreferences> = context.dataStore.data.map { prefs ->
         NewsPreferences.deserialize(
             categoriesCsv = prefs[Keys.NEWS_CATEGORIES] ?: NewsCategory.GENERAL.name,

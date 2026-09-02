@@ -25,7 +25,7 @@ TrueRadio/
 │       ├── AndroidManifest.xml
 │       ├── java/com/trueradio/app/
 │       │   ├── RadioApplication.kt          # notification channel setup
-│       │   ├── Models.kt                    # TrackInfo, DaySegment, DjUiState
+│       │   ├── Models.kt                    # TrackInfo, DaySegment, and other shared data types
 │       │   ├── SecureSettings.kt            # DataStore-backed key storage
 │       │   ├── spotify/SpotifyManager.kt    # App Remote connect/subscribe/controls
 │       │   ├── spotify/SpotifyWebAuthManager.kt # Web API OAuth (PKCE) - separate from App Remote
@@ -33,7 +33,8 @@ TrueRadio/
 │       │   ├── spotify/HourlyMixEngine.kt       # composes the personalized hourly genre mix
 │       │   ├── ai/GeminiClient.kt           # persona prompt + generateContent calls
 │       │   ├── news/NewsRepository.kt       # RSS fetch + parse + preference-based prioritization
-│       │   ├── tts/TtsManager.kt            # ElevenLabs REST + local TTS fallback
+│       │   ├── tts/CloudTtsClient.kt        # Google Cloud TTS (premium DJ voice)
+│       │   ├── tts/LocalTtsFallback.kt      # on-device TextToSpeech fallback
 │       │   ├── audio/AudioPlaybackManager.kt# AudioFocusRequest ducking + ExoPlayer
 │       │   ├── service/RadioForegroundService.kt # orchestrates everything
 │       │   └── ui/MainActivity.kt           # Compose UI: key inputs, connect toggle

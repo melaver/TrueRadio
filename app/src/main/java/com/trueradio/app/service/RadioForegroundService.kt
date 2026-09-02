@@ -8,7 +8,6 @@ import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.trueradio.app.DaySegment
-import com.trueradio.app.R
 import com.trueradio.app.RadioApplication
 import com.trueradio.app.SecureSettings
 import com.trueradio.app.TrackInfo
@@ -31,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -100,6 +100,10 @@ class RadioForegroundService : LifecycleService() {
          */
         private const val SPEECH_TIMEOUT_MS = 150_000L
         private const val PLAYBACK_TIMEOUT_MS = 90_000L
+
+        /** Backoff for reconnecting to a dropped Spotify App Remote connection. */
+        private const val RECONNECT_BASE_MS = 3_000L
+        private const val RECONNECT_MAX_MS = 60_000L
     }
 
     private lateinit var settings: SecureSettings
@@ -134,20 +138,6 @@ class RadioForegroundService : LifecycleService() {
      */
     private var lastProcessedTrackId: String? = null
 
-    /** Incremented per manual remix so each one reaches different material - see HourlyMixEngine. */
-    /**
-     * Trivia audio generated ahead of time for a specific track, played when that track reaches
-     * its boundary.
-     *
-     * Previously generation started AT the 15s boundary, which gave Gemini ~15 seconds to return
-     * both a script and audio. Any retry (429/503) blew straight past the track end and the
-     * segment was lost. Generating at track start gives the whole song's duration of headroom, so
-     * transient failures have room to recover.
-     *
-     * NOTE: this does not by itself reduce quota usage - 429 is a rate limit, not a timing
-     * problem - it just stops a slow-but-eventually-successful call from missing its window.
-     * Quota pressure is addressed separately by GeminiClient's artist-list cache.
-     */
     /**
      * Pre-generated trivia SCRIPTS keyed "artist|title", filled 5 at a time by one batched Gemini
      * call. Scripts batch cheaply; audio does not (TTS returns one stream per request), so audio
@@ -162,6 +152,19 @@ class RadioForegroundService : LifecycleService() {
     private var evergreenLines: List<String> = emptyList()
     private var segmentCounter = 0
 
+    /**
+     * Trivia audio generated ahead of time for a specific track, played when that track reaches
+     * its boundary.
+     *
+     * Previously generation started AT the 15s boundary, which gave Gemini ~15 seconds to return
+     * both a script and audio. Any retry (429/503) blew straight past the track end and the
+     * segment was lost. Generating at track start gives the whole song's duration of headroom, so
+     * transient failures have room to recover.
+     *
+     * NOTE: this does not by itself reduce quota usage - 429 is a rate limit, not a timing
+     * problem - it just stops a slow-but-eventually-successful call from missing its window.
+     * Quota pressure is addressed separately by GeminiClient's artist-list cache.
+     */
     private var preparedTrackUri: String? = null
     private var preparedAudio: ByteArray? = null
     /** Text of [preparedAudio], kept so prefetched segments still reach the history log. */
@@ -176,6 +179,7 @@ class RadioForegroundService : LifecycleService() {
     /** Wall-clock time the radio should stop, or 0 when no sleep timer is set. */
     private var sleepAtMs = 0L
 
+    /** Incremented per manual remix so each one reaches different material - see HourlyMixEngine. */
     private var remixCount = 0
     /** Guards against a double-tap queuing two overlapping rebuilds of the same playlist. */
     private var isRemixing = false
@@ -193,6 +197,10 @@ class RadioForegroundService : LifecycleService() {
      */
     private var isInitialized = false
     private var playbackJob: Job? = null
+
+    /** Reset to 0 whenever a PlayerState genuinely arrives - proof the connection is healthy. */
+    private var reconnectAttempts = 0
+    private var reconnectJob: Job? = null
 
     /**
      * When the current mix was built. Rebuilding is expensive (several Gemini + Spotify calls),
@@ -280,7 +288,20 @@ class RadioForegroundService : LifecycleService() {
                     return START_STICKY
                 }
                 val clientId = intent?.getStringExtra(EXTRA_SPOTIFY_CLIENT_ID)
-                lifecycleScope.launch { initializeAndConnect(clientId) }
+                lifecycleScope.launch {
+                    try {
+                        initializeAndConnect(clientId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // Anything unhandled here (e.g. a corrupted DataStore read) would
+                        // otherwise crash lifecycleScope - and with it every other coroutine the
+                        // service depends on (the playback ticker, the player-state subscription) -
+                        // taking the whole DJ down over a single startup failure.
+                        Log.e(TAG, "initializeAndConnect threw", e)
+                        updateStatus("Startup failed: ${e.message}")
+                    }
+                }
             }
         }
         return START_STICKY
@@ -355,9 +376,63 @@ class RadioForegroundService : LifecycleService() {
         // would deliver every PlayerState twice and double every downstream trigger.
         playbackJob?.cancel()
         playbackJob = manager.observePlayerState()
-            .onEach { track -> onPlayerState(track) }
-            .catch { e -> updateStatus("Playback stream error: ${e.message}") }
+            .onEach { track ->
+                // A PlayerState actually arriving is proof the connection is alive; clears the
+                // backoff so a later drop starts reconnecting quickly again instead of picking up
+                // wherever a previous, unrelated outage left off.
+                reconnectAttempts = 0
+                onPlayerState(track)
+            }
+            .catch { e ->
+                updateStatus("Playback stream error: ${e.message}")
+                scheduleReconnect(manager)
+            }
             .launchIn(lifecycleScope)
+    }
+
+    /**
+     * Reconnects after the App Remote connection drops - the SDK surfaces this as the
+     * PlayerState flow closing/erroring, not as a distinct "disconnected" callback. Without this,
+     * a dropped connection (Spotify killed by the OS, backgrounded and reclaimed, a transient IPC
+     * hiccup) left the DJ silently dead: the flow's catch block updated a status string nobody
+     * automatically retries, and the service kept running while doing nothing forever.
+     *
+     * Bounded to one in-flight attempt at a time (checked via [reconnectJob]) and backs off
+     * exponentially up to [RECONNECT_MAX_MS] rather than hammering the SDK in a tight loop; retries
+     * indefinitely since this service is meant to run for hours and Spotify coming back (the user
+     * reopens it, connectivity returns) is exactly the case this exists for.
+     */
+    private fun scheduleReconnect(manager: SpotifyManager) {
+        if (reconnectJob?.isActive == true) return
+        reconnectAttempts++
+        val attempt = reconnectAttempts
+        val delayMs = (RECONNECT_BASE_MS * (1L shl (attempt - 1).coerceAtMost(4)))
+            .coerceAtMost(RECONNECT_MAX_MS)
+        Log.w(TAG, "Spotify App Remote disconnected - reconnect attempt $attempt in ${delayMs}ms")
+        updateStatus("Spotify disconnected - reconnecting...")
+        reconnectJob = lifecycleScope.launch {
+            try {
+                delay(delayMs)
+                // Release whatever the SDK left behind before reconnecting, so a failed handle
+                // isn't leaked across attempts.
+                manager.disconnect()
+                manager.connect { success, error ->
+                    if (success) {
+                        Log.d(TAG, "Spotify App Remote reconnected (attempt $attempt)")
+                        updateStatus("Reconnected to Spotify")
+                        observePlayback(manager)
+                    } else {
+                        Log.w(TAG, "Reconnect attempt $attempt failed: ${error?.message}")
+                        scheduleReconnect(manager)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Reconnect attempt $attempt threw", e)
+                scheduleReconnect(manager)
+            }
+        }
     }
 
     private fun onPlayerState(track: TrackInfo) {
@@ -432,32 +507,43 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             while (isActive) {
                 delay(PLAYBACK_TICK_MS)
-                // Sleep timer is checked BEFORE the paused guard: it's a wall-clock promise to
-                // stop, so pausing and walking away must still shut the radio down rather than
-                // leaving the service running indefinitely with a frozen timer.
-                if (sleepAtMs > 0L) {
-                    val remainingMs = sleepAtMs - System.currentTimeMillis()
-                    if (remainingMs <= 0L) {
-                        Log.d(TAG, "Sleep timer elapsed - stopping radio")
-                        sleepAtMs = 0L
-                        RadioServiceState.setSleepMinutesRemaining(null)
-                        spotifyManager?.pause()
-                        stopSelf()
-                        return@launch
+                // This loop is the only clock behind the sleep timer, the news flash and track
+                // trivia - an unhandled exception on any one tick would cancel the whole
+                // lifecycleScope (crashing the service, per Kotlin coroutines' default behaviour
+                // for an uncaught exception), silently taking every other trigger down with it.
+                // One bad tick logging and continuing is a far smaller failure than that.
+                try {
+                    // Sleep timer is checked BEFORE the paused guard: it's a wall-clock promise to
+                    // stop, so pausing and walking away must still shut the radio down rather than
+                    // leaving the service running indefinitely with a frozen timer.
+                    if (sleepAtMs > 0L) {
+                        val remainingMs = sleepAtMs - System.currentTimeMillis()
+                        if (remainingMs <= 0L) {
+                            Log.d(TAG, "Sleep timer elapsed - stopping radio")
+                            sleepAtMs = 0L
+                            RadioServiceState.setSleepMinutesRemaining(null)
+                            spotifyManager?.pause()
+                            stopSelf()
+                            return@launch
+                        }
+                        RadioServiceState.setSleepMinutesRemaining((remainingMs / 60_000).toInt() + 1)
                     }
-                    RadioServiceState.setSleepMinutesRemaining((remainingMs / 60_000).toInt() + 1)
-                }
 
-                if (lastKnownIsPaused) continue // only count playback time for everything below
+                    if (lastKnownIsPaused) continue // only count playback time for everything below
 
-                RadioServiceState.setRateLimited(GeminiClient.isRateLimited())
-                RadioServiceState.setDailyQuotaExhausted(GeminiClient.isLikelyDailyQuotaExhausted())
-                playbackMsSinceNews += PLAYBACK_TICK_MS
-                if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
-                    maybeTriggerNewsFlash()
-                    continue // don't also evaluate trivia on the same tick
+                    RadioServiceState.setRateLimited(GeminiClient.isRateLimited())
+                    RadioServiceState.setDailyQuotaExhausted(GeminiClient.isLikelyDailyQuotaExhausted())
+                    playbackMsSinceNews += PLAYBACK_TICK_MS
+                    if (playbackMsSinceNews >= NEWS_INTERVAL_PLAYBACK_MS) {
+                        maybeTriggerNewsFlash()
+                        continue // don't also evaluate trivia on the same tick
+                    }
+                    maybeTriggerTrackTrivia()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Playback ticker tick threw - continuing", e)
                 }
-                maybeTriggerTrackTrivia()
             }
         }
     }
@@ -472,6 +558,13 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             try {
                 runNewsFlash()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // An uncaught throw here would still unlock via finally, but would then propagate
+                // out of this coroutine and crash lifecycleScope - see startPlaybackTicker.
+                Log.e(DJ_TAG, "News flash threw", e)
+                updateStatus("News flash failed: ${e.message}")
             } finally {
                 speakingMutex.unlock()
             }
@@ -495,6 +588,11 @@ class RadioForegroundService : LifecycleService() {
                 if (spotifyWebAuthManager?.isConnected() == true) {
                     runGenreSwitch(hour, announce = true)
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Genre switch threw", e)
+                updateStatus("Genre switch failed: ${e.message}")
             } finally {
                 speakingMutex.unlock()
             }
@@ -537,6 +635,11 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             try {
                 runTrackTrivia(track)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Track trivia threw", e)
+                updateStatus("Trivia failed: ${e.message}")
             } finally {
                 speakingMutex.unlock()
             }
@@ -601,8 +704,34 @@ class RadioForegroundService : LifecycleService() {
                 preparedAudio = wav
                 preparedScript = script
                 Log.d(DJ_TAG, "Step 0: PREFETCH READY (${wav.size} bytes) for '${track.title}'")
+            } catch (e: CancellationException) {
+                // Expected and frequent: a new track supersedes the in-flight prefetch for the
+                // old one (see prefetchJob?.cancel() above) - not a failure worth logging as one.
+                throw e
             } catch (e: Exception) {
                 Log.e(DJ_TAG, "Step 0: prefetch threw", e)
+            }
+        }
+    }
+
+    /** Generates the evergreen bank once, on first run. */
+    private fun ensureEvergreenLines() {
+        if (evergreenLines.isNotEmpty()) return
+        if (GeminiClient.isRateLimited()) return
+        val gemini = geminiClient ?: return
+        lifecycleScope.launch {
+            try {
+                gemini.generateEvergreenLines().getOrNull()?.let { lines ->
+                    if (lines.isNotEmpty()) {
+                        evergreenLines = lines
+                        settings.saveEvergreenLines(lines)
+                        Log.d(DJ_TAG, "Generated ${lines.size} evergreen lines (one-time)")
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Evergreen line generation threw", e)
             }
         }
     }
@@ -612,22 +741,6 @@ class RadioForegroundService : LifecycleService() {
      * published mix. Runs only when the cache is nearly empty, so it costs roughly one Gemini
      * call per five songs instead of one per song.
      */
-    /** Generates the evergreen bank once, on first run. */
-    private fun ensureEvergreenLines() {
-        if (evergreenLines.isNotEmpty()) return
-        if (GeminiClient.isRateLimited()) return
-        val gemini = geminiClient ?: return
-        lifecycleScope.launch {
-            gemini.generateEvergreenLines().getOrNull()?.let { lines ->
-                if (lines.isNotEmpty()) {
-                    evergreenLines = lines
-                    settings.saveEvergreenLines(lines)
-                    Log.d(DJ_TAG, "Generated ${lines.size} evergreen lines (one-time)")
-                }
-            }
-        }
-    }
-
     private fun maybeRefillScriptBatch() {
         if (GeminiClient.isRateLimited()) return
         if (scriptCache.size >= SCRIPT_REFILL_THRESHOLD) return
@@ -659,6 +772,8 @@ class RadioForegroundService : LifecycleService() {
                 settings.saveScriptCache(scriptCache)
                 geminiClient?.artistCacheSnapshot()?.let { settings.saveArtistListCache(it) }
                 Log.d(DJ_TAG, "Step 0b: BATCH READY - ${scripts.size} scripts cached")
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(DJ_TAG, "Step 0b: batch threw", e)
             }
@@ -717,6 +832,8 @@ class RadioForegroundService : LifecycleService() {
                 consumedScriptKeys.clear()
                 spotifyManager?.playUri(uri)
                 updateStatus("Fresh $genre mix on air")
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Remix threw", e)
                 updateStatus("Remix failed")
@@ -740,6 +857,11 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             try {
                 runNewsFlash()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Forced news flash threw", e)
+                updateStatus("News flash failed: ${e.message}")
             } finally {
                 speakingMutex.unlock()
             }
@@ -765,6 +887,11 @@ class RadioForegroundService : LifecycleService() {
         lifecycleScope.launch {
             try {
                 runTrackTrivia(track)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(DJ_TAG, "Forced DJ transition threw", e)
+                updateStatus("Force DJ failed: ${e.message}")
             } finally {
                 speakingMutex.unlock()
             }
@@ -873,11 +1000,6 @@ class RadioForegroundService : LifecycleService() {
     }
 
     /**
-     * Simple templated line used when Gemini is unavailable (rate limited or offline). It's not
-     * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
-     * rate limit meant the segment was dropped entirely and the radio just went quiet.
-     */
-    /**
      * Reads the fetched headlines with a fixed intro. Used whenever Gemini is unavailable - the
      * RSS feed already gave us the actual news, so the bulletin still carries real information;
      * only the witty summarising is lost.
@@ -902,6 +1024,11 @@ class RadioForegroundService : LifecycleService() {
     private fun templatedGenreLine(genre: String): String =
         genreChangeTemplates.random().format(genre)
 
+    /**
+     * Simple templated line used when Gemini is unavailable (rate limited or offline). It's not
+     * witty, but a DJ that says the artist's name beats a DJ that says nothing - previously a
+     * rate limit meant the segment was dropped entirely and the radio just went quiet.
+     */
     private fun fallbackTriviaLine(track: TrackInfo): String =
         "That was ${track.artist}, with ${track.title}. Let's keep it going."
 
@@ -910,6 +1037,15 @@ class RadioForegroundService : LifecycleService() {
         val prepared = preparedAudio?.takeIf { preparedTrackUri == track.uri }
         if (prepared != null) {
             Log.d(DJ_TAG, "Step 2: using PREFETCHED audio for '${track.title}'")
+            // Prefetch only ever runs for a "real trivia" segment (see prefetchTriviaFor), so
+            // this counts the same as the live-generation branch below. Without this, the counter
+            // only ever advanced on the non-prefetched path - once a real-trivia segment WAS
+            // successfully prefetched and played, segmentCounter froze here forever, so every
+            // subsequent track kept re-evaluating "is the next segment due for real trivia?"
+            // against that same stale value and kept answering yes - the evergreen filler that's
+            // supposed to carry two-thirds of segments never got a turn again, and Gemini/TTS
+            // usage silently climbed straight back up to one call per segment.
+            segmentCounter++
             val preparedText = preparedScript
             preparedAudio = null
             preparedTrackUri = null
@@ -958,6 +1094,8 @@ class RadioForegroundService : LifecycleService() {
             }
             if (played == null) Log.e(DJ_TAG, "Step 6: [$label] PLAYBACK TIMED OUT")
             else Log.d(DJ_TAG, "Step 6: [$label] PLAYBACK COMPLETE (prefetched)")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(DJ_TAG, "[$label] prepared playback threw", e)
         } finally {
@@ -1013,6 +1151,8 @@ class RadioForegroundService : LifecycleService() {
                 val spoke = localTts?.speak(script, djLanguage) ?: false
                 Log.d(DJ_TAG, "Step 6: [$label] fallback TTS ${if (spoke) "COMPLETE" else "FAILED - segment skipped"}")
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             // Never let a DJ failure kill the service or leave music ducked.
             Log.e(DJ_TAG, "[$label] speech path threw - aborting segment", e)
@@ -1055,6 +1195,8 @@ class RadioForegroundService : LifecycleService() {
                 Log.d(TAG, "Recorded ${if (liked) "LIKE" else "DISLIKE"} for ${track.artist} - ${track.title}")
                 updateStatus(if (liked) "Liked ${track.title}" else "Disliked ${track.title} - skipping")
                 if (!liked) spotifyManager?.skipNext()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to record feedback", e)
             }
@@ -1078,9 +1220,11 @@ class RadioForegroundService : LifecycleService() {
 
     private fun togglePlayback() {
         val manager = spotifyManager ?: return
-        // NOTE: SpotifyManager does not currently expose the last-known isPaused flag directly;
-        // wire this to the latest TrackInfo (e.g. cache it in onPlayerState) for a precise toggle.
-        manager.play()
+        // currentTrack.isPaused is kept current by onPlayerState on every PlayerState update, so
+        // it's a reliable source for which direction to toggle. Previously this always called
+        // play(), which meant the notification's Play/Pause button could never actually pause -
+        // tapping it while playing just re-issued a redundant resume.
+        if (currentTrack?.isPaused == true) manager.play() else manager.pause()
     }
 
     private fun updateStatus(message: String) {
@@ -1153,6 +1297,7 @@ class RadioForegroundService : LifecycleService() {
         spotifyManager?.disconnect()
         isInitialized = false
         playbackJob?.cancel()
+        reconnectJob?.cancel()
         prefetchJob?.cancel()
         batchJob?.cancel()
         RadioServiceState.setRunning(false)
