@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -173,9 +174,26 @@ class MainActivity : ComponentActivity() {
         pendingPreAuthManager = preAuthManager
         preAuthManager.connect { success, error ->
             Log.d(TAG, "Pre-auth finished (success=$success, error=${error?.message})")
-            preAuthManager.disconnect()
-            pendingPreAuthManager = null
-            launchForegroundService(spotifyClientId)
+            // This callback is unguarded SDK-invoked code, not something already wrapped by the
+            // framework - an uncaught throw here crashes the whole app. In particular,
+            // showAuthView(true) can briefly hand focus to Spotify's own consent screen on first
+            // authorization; if the OS considers this Activity no longer eligible to start a
+            // foreground service by the time this callback fires, startForegroundService() below
+            // can throw ForegroundServiceStartNotAllowedException (API 31+) - an instant crash
+            // right where the user just tapped "start". Catching it trades that crash for a
+            // visible message and a chance to just tap the button again.
+            try {
+                preAuthManager.disconnect()
+                pendingPreAuthManager = null
+                launchForegroundService(spotifyClientId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start the radio service after Spotify pre-auth", e)
+                Toast.makeText(
+                    this,
+                    "Couldn't start the radio: ${e.message}. Try tapping start again.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
     }
 
