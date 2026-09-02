@@ -292,6 +292,15 @@ class RadioForegroundService : LifecycleService() {
                     Log.d(TAG, "Already initialized - ignoring duplicate start command")
                     return START_STICKY
                 }
+                // Set synchronously, before launching the coroutine below - onStartCommand calls
+                // are serialized by the framework, so this closes the window where a second
+                // ACTION_START racing in immediately behind this one (e.g. a rapid double-tap of
+                // the power button before the service's "running" state has propagated back to
+                // the UI) would otherwise also see isInitialized still false - it used to only get
+                // set well into initializeAndConnect, after several suspending DataStore reads,
+                // which was plenty of time for that race to land and spin up a second, redundant
+                // SpotifyManager/GeminiClient/etc. with its App Remote connection never released.
+                isInitialized = true
                 val clientId = intent?.getStringExtra(EXTRA_SPOTIFY_CLIENT_ID)
                 lifecycleScope.launch {
                     try {
@@ -305,6 +314,11 @@ class RadioForegroundService : LifecycleService() {
                         // taking the whole DJ down over a single startup failure.
                         Log.e(TAG, "initializeAndConnect threw", e)
                         updateStatus("Startup failed: ${e.message}")
+                        // Without this, isInitialized stays true forever after ANY startup
+                        // failure, not just a failed Spotify connect - the guard above would then
+                        // silently swallow every future "start radio" tap, leaving the service
+                        // alive and doing nothing with no way to retry short of stopping it first.
+                        isInitialized = false
                     }
                 }
             }
@@ -322,6 +336,10 @@ class RadioForegroundService : LifecycleService() {
 
         if (clientId.isBlank()) {
             updateStatus("Missing Spotify client ID - open the app and enter your keys.")
+            // onStartCommand already set isInitialized = true before launching this coroutine;
+            // undo that here since this attempt never got anywhere near actually starting, so a
+            // corrected client ID can retry without being silently ignored as a "duplicate start".
+            isInitialized = false
             return
         }
 
@@ -329,7 +347,6 @@ class RadioForegroundService : LifecycleService() {
             Log.e(TAG, "Gemini API key is blank - DJ speech will be unavailable")
             updateStatus("Missing Gemini API key - the DJ can't speak. Add it in Settings.")
         }
-        isInitialized = true
         geminiClient = GeminiClient(geminiKey, djLanguage)
         localTts = LocalTtsFallback(applicationContext)
 
@@ -358,9 +375,30 @@ class RadioForegroundService : LifecycleService() {
                 updateStatus("Connected to Spotify")
                 observePlayback(manager)
                 startPlaybackTicker()
-                lifecycleScope.launch { startInitialPlayback(manager) }
+                lifecycleScope.launch {
+                    try {
+                        startInitialPlayback(manager)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // This is the first thing that runs after a successful connection on
+                        // every single "start radio" - unguarded, an unexpected throw here (e.g.
+                        // a corrupted DataStore read inside runGenreSwitch) crashes the whole
+                        // lifecycleScope, taking the playback ticker and player-state
+                        // subscription down with it right as the user just tapped start.
+                        Log.e(TAG, "Initial playback threw", e)
+                        updateStatus("Failed to start playback: ${e.message}")
+                    }
+                }
             } else {
+                Log.e(TAG, "Spotify connect failed", error)
                 updateStatus("Spotify connection failed: ${error?.message}")
+                // Without this, isInitialized (set true by onStartCommand before this whole chain
+                // started) stays true forever after a failed connection - the duplicate-start
+                // guard there would then silently ignore every future tap of "start radio",
+                // leaving the service alive and doing nothing with no way to retry short of
+                // stopping it first.
+                isInitialized = false
             }
         }
     }
