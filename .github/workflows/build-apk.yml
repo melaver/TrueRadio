@@ -13,7 +13,17 @@ name: Build debug APK
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      description:
+        description: 'What changed in this run (shown as the run name in the Actions list)'
+        required: false
+        default: ''
+
+# Manual runs show `description` as the run's title in the Actions list instead of the generic
+# workflow name, so a run triggered to verify a specific fix reads as that fix rather than as an
+# unlabelled "Build debug APK" indistinguishable from every other run.
+run-name: ${{ inputs.description || 'Build debug APK' }}
 
 jobs:
   build:
