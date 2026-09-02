@@ -114,6 +114,15 @@ dependencies {
     // see README for download instructions from developer.spotify.com)
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar", "*.jar"))))
 
+    // Required by the Spotify App Remote SDK itself at runtime (com.spotify.protocol.mappers.
+    // gson.GsonMapper, used internally by ConnectionParams.Builder().build() - i.e. on every
+    // single SpotifyManager.connect() call). This app's own code hasn't called Gson directly
+    // since TtsManager was removed, but the SDK is included as a raw fileTree .aar with no POM,
+    // so Gradle has no way to pull this in as a transitive dependency or even warn that it's
+    // missing - dropping it compiled fine and only failed with a NoClassDefFoundError the moment
+    // App Remote's own code path actually ran, i.e. instantly on every tap of "start radio".
+    implementation("com.google.code.gson:gson:2.11.0")
+
     // DataStore for storing API keys locally
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
