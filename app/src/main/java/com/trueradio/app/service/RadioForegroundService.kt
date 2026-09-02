@@ -238,11 +238,29 @@ class RadioForegroundService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
-        settings = SecureSettings(applicationContext)
-        newsRepository = NewsRepository()
-        audioPlaybackManager = AudioPlaybackManager(applicationContext)
-        RadioServiceState.setRunning(true)
-        startForeground(NOTIFICATION_ID, buildNotification(lastKnownTrackLabel, _status.value, isPaused = false))
+        // The one remaining unguarded step in the whole start-radio chain - every step after
+        // this is now wrapped, but onCreate() itself never was. The OS requires startForeground()
+        // to be called within seconds of startForegroundService() or it kills the process with a
+        // RemoteServiceException - a worse, less informative crash than this. If anything above
+        // throws (however unlikely - these are simple constructors), still satisfy that contract
+        // with a minimal notification, log what actually failed, and shut down cleanly instead of
+        // continuing in a half-initialized state.
+        try {
+            settings = SecureSettings(applicationContext)
+            newsRepository = NewsRepository()
+            audioPlaybackManager = AudioPlaybackManager(applicationContext)
+            RadioServiceState.setRunning(true)
+            startForeground(NOTIFICATION_ID, buildNotification(lastKnownTrackLabel, _status.value, isPaused = false))
+        } catch (e: Exception) {
+            Log.e(TAG, "onCreate failed", e)
+            try {
+                startForeground(NOTIFICATION_ID, buildNotification("TrueRadio", "Failed to start: ${e.message}", isPaused = true))
+            } catch (inner: Exception) {
+                Log.e(TAG, "Fallback startForeground also failed", inner)
+            }
+            RadioServiceState.setRunning(false)
+            stopSelf()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -1350,7 +1368,12 @@ class RadioForegroundService : LifecycleService() {
         batchJob?.cancel()
         RadioServiceState.setRunning(false)
         localTts?.release()
-        audioPlaybackManager.release()
+        // Guarded rather than a bare call: if onCreate()'s own try/catch fires because
+        // AudioPlaybackManager's construction is what threw, this lateinit was never assigned -
+        // stopSelf() from that catch block leads straight here, and an unconditional call would
+        // throw UninitializedPropertyAccessException, crashing the app a second time from inside
+        // the very recovery path meant to prevent that first crash.
+        if (::audioPlaybackManager.isInitialized) audioPlaybackManager.release()
         super.onDestroy()
     }
 
