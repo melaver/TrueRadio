@@ -170,30 +170,41 @@ class MainActivity : ComponentActivity() {
             return
         }
         Log.d(TAG, "Pre-authorizing App Remote before starting service")
-        val preAuthManager = SpotifyManager(this, spotifyClientId)
-        pendingPreAuthManager = preAuthManager
-        preAuthManager.connect { success, error ->
-            Log.d(TAG, "Pre-auth finished (success=$success, error=${error?.message})")
-            // This callback is unguarded SDK-invoked code, not something already wrapped by the
-            // framework - an uncaught throw here crashes the whole app. In particular,
-            // showAuthView(true) can briefly hand focus to Spotify's own consent screen on first
-            // authorization; if the OS considers this Activity no longer eligible to start a
-            // foreground service by the time this callback fires, startForegroundService() below
-            // can throw ForegroundServiceStartNotAllowedException (API 31+) - an instant crash
-            // right where the user just tapped "start". Catching it trades that crash for a
-            // visible message and a chance to just tap the button again.
-            try {
-                preAuthManager.disconnect()
-                pendingPreAuthManager = null
-                launchForegroundService(spotifyClientId)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start the radio service after Spotify pre-auth", e)
-                Toast.makeText(
-                    this,
-                    "Couldn't start the radio: ${e.message}. Try tapping start again.",
-                    Toast.LENGTH_LONG
-                ).show()
+        try {
+            val preAuthManager = SpotifyManager(this, spotifyClientId)
+            pendingPreAuthManager = preAuthManager
+            // connect() itself - not just its callback below - calls straight into the Spotify
+            // App Remote SDK (SpotifyAppRemote.connect) on this thread. A throw from THIS call
+            // (as opposed to the async success/failure callback it registers) previously had no
+            // guard at all - the callback's own try/catch only ever runs if connect() gets far
+            // enough to register it.
+            preAuthManager.connect { success, error ->
+                Log.d(TAG, "Pre-auth finished (success=$success, error=${error?.message})")
+                // This callback is unguarded SDK-invoked code, not something already wrapped by
+                // the framework - an uncaught throw here crashes the whole app. In particular,
+                // showAuthView(true) can briefly hand focus to Spotify's own consent screen on
+                // first authorization; if the OS considers this Activity no longer eligible to
+                // start a foreground service by the time this callback fires,
+                // startForegroundService() below can throw ForegroundServiceStartNotAllowedException
+                // (API 31+) - an instant crash right where the user just tapped "start". Catching
+                // it trades that crash for a visible message and a chance to just tap again.
+                try {
+                    preAuthManager.disconnect()
+                    pendingPreAuthManager = null
+                    launchForegroundService(spotifyClientId)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to start the radio service after Spotify pre-auth", e)
+                    Toast.makeText(
+                        this,
+                        "Couldn't start the radio: ${e.message}. Try tapping start again.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to begin Spotify pre-authorization", e)
+            pendingPreAuthManager = null
+            Toast.makeText(this, "Couldn't connect to Spotify: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
