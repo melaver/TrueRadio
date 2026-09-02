@@ -71,7 +71,9 @@ class HourlyMixEngine(
          * diminishing returns; past this point the remaining fill is taken unverified rather than
          * hammering the API.
          */
-        private const val MAX_VERIFICATIONS = 60
+        private const val MAX_VERIFICATIONS = 120
+        /** Per-tier bound on NEW artist lookups, so no single tier can drain the global budget. */
+        private const val MAX_ARTISTS_PER_TIER = 25
 
         private const val SHARE_SAVED = 0.30
         private const val SHARE_TOP = 0.25
@@ -102,20 +104,49 @@ class HourlyMixEngine(
      * [knownTags] lets callers skip the network lookup when tags are already in hand (top artists
      * arrive with theirs attached), so verification is free for the tiers built from them.
      */
+    /**
+     * Result of a genre check. UNKNOWN is distinct from NO because callers must be able to treat
+     * "we couldn't find out" differently from "we checked and it doesn't match" - conflating them
+     * meant an exhausted lookup budget silently rejected every remaining candidate and produced an
+     * empty playlist.
+     */
+    private enum class GenreVerdict { YES, NO, UNKNOWN }
+
+    private suspend fun verifyArtistGenre(
+        artistName: String,
+        genreLower: String,
+        knownTags: List<String>? = null
+    ): GenreVerdict {
+        val key = artistName.lowercase()
+
+        knownTags?.let {
+            return if (it.any { tag -> tagMatchesGenre(tag, genreLower) }) GenreVerdict.YES else GenreVerdict.NO
+        }
+
+        // containsKey, not getOrPut: getOrPut treats a cached null as "absent" and recomputes, so
+        // every artist with no Spotify match was re-fetched on each encounter - burning the lookup
+        // budget on the same failures over and over.
+        if (genreTagCache.containsKey(key)) {
+            val cached = genreTagCache[key]
+                ?: return GenreVerdict.NO // looked up before, genuinely no match
+            return if (cached.any { tagMatchesGenre(it, genreLower) }) GenreVerdict.YES else GenreVerdict.NO
+        }
+
+        if (verificationCount >= MAX_VERIFICATIONS) return GenreVerdict.UNKNOWN
+
+        verificationCount++
+        val tags = webApi.searchArtistByName(artistName).getOrNull()?.genres
+        genreTagCache[key] = tags
+        if (tags == null) return GenreVerdict.NO
+        return if (tags.any { tagMatchesGenre(it, genreLower) }) GenreVerdict.YES else GenreVerdict.NO
+    }
+
+    /** Convenience for call sites that only care whether the artist positively matches. */
     private suspend fun artistMatchesGenre(
         artistName: String,
         genreLower: String,
         knownTags: List<String>? = null
-    ): Boolean {
-        val key = artistName.lowercase()
-        val tags = knownTags
-            ?: genreTagCache.getOrPut(key) {
-                if (verificationCount >= MAX_VERIFICATIONS) return@getOrPut null
-                verificationCount++
-                webApi.searchArtistByName(artistName).getOrNull()?.genres
-            }
-        return tags?.any { tagMatchesGenre(it, genreLower) } == true
-    }
+    ): Boolean = verifyArtistGenre(artistName, genreLower, knownTags) == GenreVerdict.YES
 
     /**
      * Mood hint per daypart, folded into artist-selection prompts.
@@ -188,17 +219,33 @@ class HourlyMixEngine(
         suspend fun verifiedTracks(candidates: List<SpotifyTrack>, cap: Int, tierName: String): List<String> {
             val out = mutableListOf<String>()
             var rejected = 0
+            var unknown = 0
+            // Distinct artists scanned by THIS tier. Without a per-tier bound, tier 1 alone could
+            // spend the whole global budget checking dozens of saved-track artists, leaving every
+            // later tier unable to verify anything - which is exactly how a "rock" mix ended up
+            // with zero tracks.
+            val scannedArtists = mutableSetOf<String>()
+
             for (track in candidates) {
                 if (out.size >= cap) break
                 if (!allowed(track)) continue
                 if (track.uri in curated || track.uri in out) continue
-                if (artistMatchesGenre(track.artistName, genreLower)) {
-                    out += track.uri
-                } else {
-                    rejected++
+
+                val artistKey = track.artistName.lowercase()
+                val alreadyKnown = genreTagCache.containsKey(artistKey)
+                if (!alreadyKnown && scannedArtists.size >= MAX_ARTISTS_PER_TIER) continue
+                if (!alreadyKnown) scannedArtists += artistKey
+
+                when (verifyArtistGenre(track.artistName, genreLower)) {
+                    GenreVerdict.YES -> out += track.uri
+                    GenreVerdict.NO -> rejected++
+                    // Budget exhausted. Accept rather than reject: these are the listener's own
+                    // saved and most-played tracks, so an unverified one is far more likely to be
+                    // on-genre than a random search result, and rejecting them all yields nothing.
+                    GenreVerdict.UNKNOWN -> { out += track.uri; unknown++ }
                 }
             }
-            Log.d(TAG, "Tier $tierName: ${out.size} accepted, $rejected rejected on genre tags")
+            Log.d(TAG, "Tier $tierName: ${out.size} accepted ($unknown unverified), $rejected rejected")
             return out
         }
 
@@ -300,10 +347,29 @@ class HourlyMixEngine(
             }
         }
 
+        // Last resort: an empty playlist is never an acceptable outcome. If every tier came back
+        // empty - verification budget exhausted, unusual tags, a sparse library - take unverified
+        // genre-search results rather than failing. A slightly loose mix beats silence, and the
+        // user asked for music, not for a purity guarantee they can't hear.
+        if (curated.isEmpty()) {
+            Log.w(TAG, "All tiers empty for '$genre' - falling back to unverified genre search")
+            val rescue = webApi.searchTracksByGenre(genre, limit = SEARCH_PAGE_SIZE, offset = 0)
+                .getOrDefault(emptyList())
+                .filter(::allowed)
+                .map { it.uri }
+            curated += rescue
+            if (rescue.isNotEmpty()) Log.d(TAG, "Rescue search recovered ${rescue.size} tracks")
+        }
+
         val finalUris = curated.distinct().take(TARGET_TRACK_COUNT)
         if (finalUris.isEmpty()) {
+            // Genuinely nothing, even unverified - almost always an auth problem rather than a
+            // genre problem, so say so instead of blaming the genre name.
             return Result.failure(
-                IllegalStateException("No tracks found for '$genre' - try a broader genre name or switch to Relaxed mode")
+                IllegalStateException(
+                    "Spotify returned no tracks for '$genre'. Check your Spotify connection in " +
+                        "Settings > Setup check, then try again."
+                )
             )
         }
         Log.d(TAG, "Publishing ${finalUris.size} tracks for '$genre' " +

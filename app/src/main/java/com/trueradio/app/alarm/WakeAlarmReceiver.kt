@@ -28,30 +28,41 @@ class WakeAlarmReceiver : BroadcastReceiver() {
         Log.d(TAG, "Wake alarm fired - starting radio")
 
         val appContext = context.applicationContext
-        // goAsync() would be cleaner for the DataStore read, but the client id is only needed to
-        // pass through to the service, which re-reads settings itself anyway - so a fire-and-forget
-        // launch is sufficient and avoids holding the broadcast open.
+        // goAsync() is required, not optional: onReceive must return quickly, and once it does the
+        // process becomes eligible for termination. A bare coroutine launch could be killed before
+        // the DataStore read completes, so the alarm would fire and silently do nothing - the
+        // worst possible failure for something acting as an alarm clock. The pending result is
+        // finished in the coroutine's finally block.
+        val pendingResult = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
-            val settings = SecureSettings(appContext)
-            val clientId = settings.snapshotSpotifyClientId()
-            if (clientId.isBlank()) {
-                Log.e(TAG, "Wake alarm: no Spotify client id configured")
-                return@launch
-            }
-            val serviceIntent = Intent(appContext, RadioForegroundService::class.java).apply {
-                action = RadioForegroundService.ACTION_START
-                putExtra(RadioForegroundService.EXTRA_SPOTIFY_CLIENT_ID, clientId)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                appContext.startForegroundService(serviceIntent)
-            } else {
-                appContext.startService(serviceIntent)
-            }
+            try {
+                val settings = SecureSettings(appContext)
+                val clientId = settings.snapshotSpotifyClientId()
+                if (clientId.isBlank()) {
+                    Log.e(TAG, "Wake alarm: no Spotify client id configured")
+                    return@launch
+                }
+                val serviceIntent = Intent(appContext, RadioForegroundService::class.java).apply {
+                    action = RadioForegroundService.ACTION_START
+                    putExtra(RadioForegroundService.EXTRA_SPOTIFY_CLIENT_ID, clientId)
+                }
+                // Starting a foreground service from the background is normally blocked on
+                // Android 12+, but delivery of an exact alarm grants a temporary exemption.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    appContext.startForegroundService(serviceIntent)
+                } else {
+                    appContext.startService(serviceIntent)
+                }
 
-            // Alarms are one-shot; reschedule for the same time tomorrow so it behaves like a
-            // daily alarm clock rather than firing once and silently never again.
-            val minutes = settings.snapshotWakeAlarmMinutes()
-            if (minutes != null) schedule(appContext, minutes)
+                // Alarms are one-shot; reschedule for tomorrow so this behaves like a daily alarm
+                // clock rather than firing once and silently never again.
+                val minutes = settings.snapshotWakeAlarmMinutes()
+                if (minutes != null) schedule(appContext, minutes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Wake alarm handling failed", e)
+            } finally {
+                pendingResult.finish()
+            }
         }
     }
 
@@ -98,6 +109,13 @@ class WakeAlarmReceiver : BroadcastReceiver() {
             )
             Log.d(TAG, "Wake alarm scheduled for ${target.time}")
             return true
+        }
+
+        /** Whether the OS currently permits exact alarms (Android 12+ gates this behind a toggle). */
+        fun canScheduleExact(context: Context): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            return am.canScheduleExactAlarms()
         }
 
         fun cancel(context: Context) {

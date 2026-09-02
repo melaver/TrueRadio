@@ -61,7 +61,13 @@ fun SettingsScreen(
     val sleepMinutes by RadioServiceState.sleepMinutesRemaining.collectAsState()
     val wakeAlarm by settings.wakeAlarmMinutes.collectAsState(initial = null)
     val context = androidx.compose.ui.platform.LocalContext.current
+    // Reflects whether the OS currently permits exact alarms, checked on entry rather than
+    // assumed - an alarm set in an earlier session can be silently invalidated if the user later
+    // revokes "Alarms & reminders", and optimistically defaulting to true would hide that.
     var alarmScheduled by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(wakeAlarm) {
+        alarmScheduled = wakeAlarm == null || WakeAlarmReceiver.canScheduleExact(context)
+    }
     val djVolume by settings.djVolume.collectAsState(initial = 1.0f)
     val savedCloudKey by settings.cloudTtsKey.collectAsState(initial = "")
     val cloudTtsVoice by settings.cloudTtsVoice.collectAsState(initial = CloudTtsClient.DEFAULT_VOICE)
