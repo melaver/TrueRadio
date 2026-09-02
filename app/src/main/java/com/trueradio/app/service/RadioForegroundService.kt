@@ -249,6 +249,11 @@ class RadioForegroundService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> {
+                // Disconnecting App Remote in onDestroy() below only lets go of the remote
+                // control - it doesn't tell Spotify to pause, so music kept playing on its own
+                // after "turning the radio off". Pause explicitly, same as the sleep timer already
+                // does when it stops the service.
+                spotifyManager?.pause()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -1294,6 +1299,11 @@ class RadioForegroundService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        // Belt-and-suspenders alongside ACTION_STOP's explicit pause() above: this also covers
+        // every OTHER way the service can end (the task swiped away, the OS killing it under
+        // memory pressure, etc.), so "the radio isn't running" never leaves music playing behind
+        // it regardless of how the service actually stopped.
+        spotifyManager?.pause()
         spotifyManager?.disconnect()
         isInitialized = false
         playbackJob?.cancel()
