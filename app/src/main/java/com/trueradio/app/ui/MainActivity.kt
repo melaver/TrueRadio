@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
+import com.google.firebase.crashlytics.FirebaseCrashlytics
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -194,6 +195,7 @@ class MainActivity : ComponentActivity() {
                     launchForegroundService(spotifyClientId)
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to start the radio service after Spotify pre-auth", e)
+                    FirebaseCrashlytics.getInstance().recordException(e)
                     Toast.makeText(
                         this,
                         "Couldn't start the radio: ${e.message}. Try tapping start again.",
@@ -203,6 +205,7 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to begin Spotify pre-authorization", e)
+            FirebaseCrashlytics.getInstance().recordException(e)
             pendingPreAuthManager = null
             Toast.makeText(this, "Couldn't connect to Spotify: ${e.message}", Toast.LENGTH_LONG).show()
         }

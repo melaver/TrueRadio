@@ -25,6 +25,7 @@ import com.trueradio.app.spotify.SpotifyWebAuthManager
 import com.trueradio.app.tts.CloudTtsClient
 import com.trueradio.app.tts.LocalTtsFallback
 import com.trueradio.app.ui.MainActivity
+import com.google.firebase.crashlytics.FirebaseCrashlytics
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.catch
@@ -253,6 +254,7 @@ class RadioForegroundService : LifecycleService() {
             startForeground(NOTIFICATION_ID, buildNotification(lastKnownTrackLabel, _status.value, isPaused = false))
         } catch (e: Exception) {
             Log.e(TAG, "onCreate failed", e)
+            FirebaseCrashlytics.getInstance().recordException(e)
             try {
                 startForeground(NOTIFICATION_ID, buildNotification("TrueRadio", "Failed to start: ${e.message}", isPaused = true))
             } catch (inner: Exception) {
@@ -331,6 +333,7 @@ class RadioForegroundService : LifecycleService() {
                         // service depends on (the playback ticker, the player-state subscription) -
                         // taking the whole DJ down over a single startup failure.
                         Log.e(TAG, "initializeAndConnect threw", e)
+                        FirebaseCrashlytics.getInstance().recordException(e)
                         updateStatus("Startup failed: ${e.message}")
                         // Without this, isInitialized stays true forever after ANY startup
                         // failure, not just a failed Spotify connect - the guard above would then
@@ -405,11 +408,13 @@ class RadioForegroundService : LifecycleService() {
                         // lifecycleScope, taking the playback ticker and player-state
                         // subscription down with it right as the user just tapped start.
                         Log.e(TAG, "Initial playback threw", e)
+                        FirebaseCrashlytics.getInstance().recordException(e)
                         updateStatus("Failed to start playback: ${e.message}")
                     }
                 }
             } else {
                 Log.e(TAG, "Spotify connect failed", error)
+                error?.let { FirebaseCrashlytics.getInstance().recordException(it) }
                 updateStatus("Spotify connection failed: ${error?.message}")
                 // Without this, isInitialized (set true by onStartCommand before this whole chain
                 // started) stays true forever after a failed connection - the duplicate-start

@@ -92,6 +92,23 @@ TrueRadio/
 4. If the ElevenLabs call fails for any reason (offline, quota, bad key), `TtsManager`
    automatically falls back to Android's built-in `TextToSpeech` engine using a Hebrew locale.
 
+## Optional: Firebase Crashlytics (crash reports without a PC)
+
+The app can report crashes (and any exception explicitly passed to
+`FirebaseCrashlytics.getInstance().recordException(...)`) to a web dashboard, viewable from any
+browser with no `adb`/device connection needed:
+
+1. Create a free project at <https://console.firebase.google.com>, add an Android app with
+   package name `com.trueradio.app` (must match exactly), and download the resulting
+   `google-services.json`.
+2. Place it at `app/google-services.json` - it isn't a secret (it ships inside every APK anyway)
+   and is safe to commit.
+3. Build normally; the `com.google.gms.google-services` and `com.google.firebase.crashlytics`
+   Gradle plugins pick it up automatically. No code changes are needed for basic crash capture.
+
+Without `app/google-services.json` present, the build fails - this only matters if you've added
+the Crashlytics plugins locally without also adding the config file.
+
 ## 4. Build & run
 
 ```bash

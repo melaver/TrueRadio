@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "740500149033",
+    "project_id": "trueradio-3881f",
+    "storage_bucket": "trueradio-3881f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740500149033:android:ec0b14cd1ceb6112139d38",
+        "android_client_info": {
+          "package_name": "Com.TrueRadio.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB9ojEWawzDIKLqRjQUEg9ORI6gUKZMmDA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:740500149033:android:c13e57780ebb80d1139d38",
+        "android_client_info": {
+          "package_name": "com.trueradio.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB9ojEWawzDIKLqRjQUEg9ORI6gUKZMmDA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

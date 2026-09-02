@@ -1,6 +1,11 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    // Requires app/google-services.json (see README) - registers this app with the Firebase
+    // project and wires the Crashlytics Gradle plugin's mapping-file upload for readable
+    // (de-obfuscated) stack traces.
+    id("com.google.gms.google-services")
+    id("com.google.firebase.crashlytics")
 }
 
 android {
@@ -111,4 +116,9 @@ dependencies {
 
     // DataStore for storing API keys locally
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+
+    // Firebase Crashlytics - see the plugins block above for why. The BoM pins compatible
+    // versions of every Firebase artifact, so only it carries an explicit version.
+    implementation(platform("com.google.firebase:firebase-bom:33.1.2"))
+    implementation("com.google.firebase:firebase-crashlytics")
 }
